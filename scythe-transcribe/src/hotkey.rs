@@ -297,8 +297,8 @@ impl AudioCapture {
             match result {
                 Ok((sample_rate, stream)) => {
                     let _ = ready_tx.send(Ok(sample_rate));
-                    let _stream = stream;
                     let _ = stop_rx.recv();
+                    let _ = stream.pause();
                 }
                 Err(e) => {
                     let _ = ready_tx.send(Err(e));
@@ -317,14 +317,24 @@ impl AudioCapture {
         })
     }
 
-    fn stop(mut self) -> (Vec<f32>, u32) {
+    fn stop_capture_thread(&mut self) {
         let _ = self.stop_tx.send(());
         if let Some(join) = self.join.take() {
             let _ = join.join();
         }
+    }
+
+    fn stop(mut self) -> (Vec<f32>, u32) {
+        self.stop_capture_thread();
         let rate = self.sample_rate;
         let v = self.samples.lock().map(|g| g.clone()).unwrap_or_default();
         (v, rate)
+    }
+}
+
+impl Drop for AudioCapture {
+    fn drop(&mut self) {
+        self.stop_capture_thread();
     }
 }
 
@@ -657,10 +667,9 @@ fn hotkey_on_release(
     let tok_ref = tok.clone();
     let combo_active = st.record_event("release", &tok_ref, configured, now);
 
-    let was_active = st.prev_active;
     st.prev_active = combo_active;
 
-    if !was_active || combo_active {
+    if st.recording.is_none() || combo_active {
         return;
     }
 
@@ -690,8 +699,10 @@ fn run_hotkey_loop() {
         if st.recording.is_none() {
             continue;
         }
-        if crate::macos::hotkey_combo_physically_pressed(&st.combo_parts).unwrap_or(true) {
-            continue;
+        match crate::macos::hotkey_combo_physically_pressed(&st.combo_parts) {
+            Some(true) => continue,
+            None if combo_requirements_met(&st.counts, &st.combo_parts) => continue,
+            Some(false) | None => {}
         }
         let now = std::time::SystemTime::now()
             .duration_since(std::time::UNIX_EPOCH)

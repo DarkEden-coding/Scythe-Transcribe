@@ -524,10 +524,11 @@ function runtimeIconColor(state: RuntimeIconState): string {
   return "#42a5f5";
 }
 
-function formatRuntimeIconState(state: RuntimeIconState): string {
-  if (state === "recording") return "Recording";
-  if (state === "processing") return "Processing";
-  return "Idle";
+function parseRuntimeIconOverride(value: string): RuntimeIconState | null {
+  if (value === "idle" || value === "recording" || value === "processing") {
+    return value;
+  }
+  return null;
 }
 
 function formatDiagnosticTime(seconds?: number | null): string {
@@ -662,6 +663,18 @@ export function App() {
     } catch {
       setRuntimeState(null);
     }
+  }, []);
+
+  const applyRuntimeIconStatus = useCallback((osIcon: RuntimeIconStatus) => {
+    setRuntimeState((prev) =>
+      prev
+        ? {
+            ...prev,
+            icon_state: osIcon.display_state,
+            os_icon: osIcon,
+          }
+        : prev,
+    );
   }, []);
 
   const refreshAccessibility = useCallback(async () => {
@@ -901,6 +914,21 @@ export function App() {
     }
   };
 
+  const setRuntimeIconOverride = async (overrideState: RuntimeIconState | null) => {
+    try {
+      const res = await apiJson<{ os_icon: RuntimeIconStatus }>("/api/runtime-icon/override", {
+        method: "PUT",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ override_state: overrideState }),
+      });
+      applyRuntimeIconStatus(res.os_icon);
+      await refreshRuntimeState();
+    } catch (e) {
+      setStatus(e instanceof Error ? e.message : String(e));
+      setStatusColor("#c62828");
+    }
+  };
+
   const refreshOrModels = async () => {
     try {
       setStatus("Loading OpenRouter models…");
@@ -1006,8 +1034,6 @@ export function App() {
   const statusIconSrc = runtimeIconSrc(actualIconState);
   const statusIconStyle = { color: runtimeIconColor(actualIconState) } as CSSProperties;
   const osIconOverride = runtimeState?.os_icon?.override_state ?? null;
-  const toolbarIconPreviewLabel =
-    osIconOverride === null ? "Follow backend" : formatRuntimeIconState(osIconOverride);
   const hotkeyDiagnostics = runtimeState?.hotkey;
   const hotkeyConflict = hotkeyConflictWarning(prefs.hotkey_toggle_recording);
   const osIconStatus = runtimeState?.os_icon;
@@ -1343,27 +1369,21 @@ export function App() {
                       : "Not capturing"}
                 </span>
               </div>
-              <button
-                type="button"
-                className="btn-outline"
-                onKeyDown={preventModifiedButtonActivation}
-                onKeyUp={preventModifiedButtonActivation}
-                onClick={() => {
-                  void (async () => {
-                    try {
-                      await apiJson<{ os_icon: RuntimeIconStatus }>("/api/runtime-icon/cycle", {
-                        method: "POST",
-                      });
-                      await refreshRuntimeState();
-                    } catch (e) {
-                      setStatus(e instanceof Error ? e.message : String(e));
-                      setStatusColor("#c62828");
-                    }
-                  })();
-                }}
-              >
-                Cycle macOS icon: {toolbarIconPreviewLabel}
-              </button>
+              <label className="field-inline field-inline--runtime-icon">
+                <span className="field-inline-label">OS icon override</span>
+                <select
+                  className="input-field input-field--toolbar"
+                  value={osIconOverride ?? ""}
+                  onChange={(e) =>
+                    void setRuntimeIconOverride(parseRuntimeIconOverride(e.target.value))
+                  }
+                >
+                  <option value="">Follow backend</option>
+                  <option value="idle">Idle blue</option>
+                  <option value="recording">Recording red</option>
+                  <option value="processing">Processing yellow</option>
+                </select>
+              </label>
             </div>
 
             <div className="diagnostic-grid">

@@ -275,7 +275,7 @@ where
     _listen(callback)
 }
 
-/// Listening to macOS keyboard events only, using a session-level listen-only tap.
+/// Listening to macOS keyboard events only, using a HID listen-only tap.
 #[cfg(target_os = "macos")]
 pub fn listen_keyboard<T>(callback: T) -> Result<(), ListenError>
 where

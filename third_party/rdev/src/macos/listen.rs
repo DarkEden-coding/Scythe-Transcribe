@@ -86,7 +86,7 @@ where
 {
     listen_with_options(
         callback,
-        CGEventTapLocation::Session,
+        CGEventTapLocation::HID,
         kCGEventMaskForKeyboardEvents,
     )
 }

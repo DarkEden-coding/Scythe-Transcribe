@@ -12,7 +12,7 @@ use std::time::Duration;
 use scythe_transcribe::config::PUBLIC_BASE_URL;
 use scythe_transcribe::hotkey;
 use scythe_transcribe::instance_lock;
-use scythe_transcribe::paths::tray_icon_path;
+use scythe_transcribe::runtime_icon;
 use scythe_transcribe::server::{self, AppState};
 use tao::event::Event;
 use tao::event_loop::{ControlFlow, EventLoopBuilder};
@@ -58,11 +58,12 @@ fn open_settings_url() {
 }
 
 enum UserEvent {
+    IconChanged(String),
     Menu(MenuEvent),
 }
 
-fn load_tray_icon() -> tray_icon::Icon {
-    let path = tray_icon_path();
+fn load_tray_icon(state: &str) -> tray_icon::Icon {
+    let path = runtime_icon::resolve_state_icon_path(state);
     let image = image::open(&path)
         .unwrap_or_else(|_| panic!("missing tray icon at {}", path.display()))
         .into_rgba8();
@@ -79,9 +80,18 @@ fn run_tray(server_enabled: Arc<AtomicBool>) {
         event_loop.set_activate_ignoring_other_apps(true);
     }
     let proxy = event_loop.create_proxy();
+    let menu_proxy = proxy.clone();
     MenuEvent::set_event_handler(Some(move |e| {
-        let _ = proxy.send_event(UserEvent::Menu(e));
+        let _ = menu_proxy.send_event(UserEvent::Menu(e));
     }));
+    let icon_rx = runtime_icon::subscribe_icon_changes();
+    thread::spawn(move || {
+        while let Ok(state) = icon_rx.recv() {
+            if proxy.send_event(UserEvent::IconChanged(state)).is_err() {
+                break;
+            }
+        }
+    });
 
     let menu = Menu::new();
     let open_i = MenuItem::new("Open settings", true, None);
@@ -99,6 +109,7 @@ fn run_tray(server_enabled: Arc<AtomicBool>) {
 
     let mut tray = None::<tray_icon::TrayIcon>;
     let server_enabled_menu = server_enabled.clone();
+    let mut current_icon_state = runtime_icon::get_icon_status().display_state;
 
     event_loop.run(move |event, _target, control_flow| {
         *control_flow = ControlFlow::Wait;
@@ -109,7 +120,7 @@ fn run_tray(server_enabled: Arc<AtomicBool>) {
                     &server_toggle_i,
                     server_enabled_menu.load(Ordering::SeqCst),
                 );
-                let icon = load_tray_icon();
+                let icon = load_tray_icon(&current_icon_state);
                 tray = Some(
                     TrayIconBuilder::new()
                         .with_menu(Box::new(menu.clone()))
@@ -118,6 +129,15 @@ fn run_tray(server_enabled: Arc<AtomicBool>) {
                         .build()
                         .expect("tray icon"),
                 );
+            }
+            Event::UserEvent(UserEvent::IconChanged(state)) => {
+                current_icon_state = state;
+                if let Some(tray_icon) = tray.as_ref() {
+                    let icon = load_tray_icon(&current_icon_state);
+                    if let Err(e) = tray_icon.set_icon(Some(icon)) {
+                        tracing::warn!("failed to update tray icon: {e}");
+                    }
+                }
             }
             Event::UserEvent(UserEvent::Menu(e)) => {
                 if e.id == open_i.id() {

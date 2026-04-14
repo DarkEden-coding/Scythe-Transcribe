@@ -917,6 +917,10 @@ a {
   width: min(200px, 100%);
 }
 
+.field-inline--runtime-icon {
+  flex: 0 1 240px;
+}
+
 .field-inline--toolbar .input-field,
 .field-inline .input-field--toolbar {
   margin-top: 0;
