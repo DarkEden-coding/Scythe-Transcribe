@@ -1,9 +1,9 @@
 //! OpenRouter: models, audio chat transcription, and text chat.
 
-use std::collections::HashSet;
+use std::collections::{HashMap, HashSet};
 
 use base64::Engine;
-use serde_json::Value;
+use serde_json::{json, Value};
 
 use crate::config::postprocess_max_completion_tokens;
 use crate::models::OpenRouterModelInfo;
@@ -172,7 +172,7 @@ pub async fn transcribe_with_audio_model(
     model: &str,
     wav_bytes: &[u8],
     instruction: &str,
-) -> anyhow::Result<String> {
+) -> anyhow::Result<OpenRouterTranscriptionResult> {
     let b64 = base64::engine::general_purpose::STANDARD.encode(wav_bytes);
     let payload = serde_json::json!({
         "model": model,
@@ -200,7 +200,7 @@ pub async fn transcribe_with_audio_model(
         .await?
         .error_for_status()?;
     let data: Value = res.json().await?;
-    Ok(extract_assistant_text(&data))
+    Ok(transcription_result_from_json(&data))
 }
 
 pub async fn chat_text(
@@ -269,6 +269,38 @@ pub fn extract_assistant_text(data: &Value) -> String {
         return parts.join("\n").trim().to_string();
     }
     String::new()
+}
+
+#[derive(Debug, Clone)]
+pub struct OpenRouterTranscriptionResult {
+    pub text: String,
+    pub metadata: HashMap<String, Value>,
+}
+
+fn copy_metadata_field(metadata: &mut HashMap<String, Value>, data: &Value, key: &str) {
+    if let Some(v) = data.get(key) {
+        metadata.insert(key.to_string(), v.clone());
+    }
+}
+
+#[must_use]
+pub fn transcription_result_from_json(data: &Value) -> OpenRouterTranscriptionResult {
+    let text = extract_assistant_text(data);
+    let mut metadata = HashMap::new();
+    metadata.insert("provider".to_string(), json!("openrouter"));
+    metadata.insert("response_format".to_string(), json!("chat_completions"));
+    for key in [
+        "id",
+        "model",
+        "usage",
+        "total_cost",
+        "totalCost",
+        "cost",
+        "generation_time",
+    ] {
+        copy_metadata_field(&mut metadata, data, key);
+    }
+    OpenRouterTranscriptionResult { text, metadata }
 }
 
 pub fn default_transcription_instruction() -> &'static str {

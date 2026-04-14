@@ -1,6 +1,7 @@
 //! Transcription and optional LLM post-processing.
 
 use std::collections::HashMap;
+use std::io::Cursor;
 use std::time::{SystemTime, UNIX_EPOCH};
 
 use axum::http::StatusCode;
@@ -233,6 +234,15 @@ async fn run_post_segment(
     }
 }
 
+fn wav_duration_seconds(raw: &[u8]) -> Option<f64> {
+    let reader = hound::WavReader::new(Cursor::new(raw)).ok()?;
+    let sample_rate = reader.spec().sample_rate;
+    if sample_rate == 0 {
+        return None;
+    }
+    Some(reader.duration() as f64 / sample_rate as f64)
+}
+
 #[derive(Clone, Serialize)]
 pub struct TranscribeResponse {
     pub transcript: String,
@@ -244,6 +254,8 @@ pub struct TranscribeResponse {
     pub id: String,
     pub created_at: f64,
     pub transcript_chars: usize,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub audio_duration_sec: Option<f64>,
     pub transcribe_ms: f64,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub pre_postprocess_ms: Option<f64>,
@@ -327,13 +339,12 @@ async fn transcribe_asr_openrouter(
     let t = openrouter::transcribe_with_audio_model(client, &key, model, raw, or_instr)
         .await
         .map_err(|e| (StatusCode::BAD_GATEWAY, e.to_string()))?;
-    let silence = t.trim() == OPENROUTER_TRANSCRIPTION_NONE_OUTPUT;
-    let mut meta = HashMap::new();
-    meta.insert("provider".to_string(), json!("openrouter"));
+    let silence = t.text.trim() == OPENROUTER_TRANSCRIPTION_NONE_OUTPUT;
+    let mut meta = t.metadata;
     meta.insert("model".to_string(), json!(model));
     meta.insert("response_format".to_string(), json!("chat_completions"));
     meta.insert("is_silence".to_string(), json!(silence));
-    Ok((t, silence, meta))
+    Ok((t.text, silence, meta))
 }
 
 pub async fn transcribe_wav_bytes(
@@ -352,6 +363,7 @@ pub async fn transcribe_wav_bytes(
     }
 
     let entry_id = uuid::Uuid::new_v4().to_string();
+    let audio_duration_sec = wav_duration_seconds(raw);
     let pipeline_start = std::time::Instant::now();
     let provider = TranscriptionProvider::parse(job.transcription_provider.as_str()).ok_or((
         StatusCode::BAD_REQUEST,
@@ -457,6 +469,7 @@ pub async fn transcribe_wav_bytes(
         id: entry_id.clone(),
         created_at,
         transcript_chars: if silence_detected { 0 } else { corrected.len() },
+        audio_duration_sec,
         transcribe_ms,
         pre_postprocess_ms,
         postprocess_ms,
@@ -600,6 +613,7 @@ mod tests {
             id: "i".to_string(),
             created_at: 0.0,
             transcript_chars: 0,
+            audio_duration_sec: None,
             transcribe_ms: 0.0,
             pre_postprocess_ms: None,
             postprocess_ms: None,

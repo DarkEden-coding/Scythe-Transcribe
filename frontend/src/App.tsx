@@ -1,9 +1,9 @@
 import type { CSSProperties, KeyboardEvent as ReactKeyboardEvent, PointerEvent } from "react";
-import { useCallback, useEffect, useRef, useState } from "react";
+import { useCallback, useEffect, useMemo, useRef, useState } from "react";
 import { startMicRecording } from "./audio";
 import { OpenRouterModelPicker, type OrModel } from "./OpenRouterModelPicker";
 
-type TabId = "general" | "keys" | "transcribe" | "postprocess" | "output";
+type TabId = "general" | "keys" | "transcribe" | "postprocess" | "stats" | "output";
 type RuntimeIconState = "idle" | "recording" | "processing";
 type RuntimeIconStatus = {
   base_state: RuntimeIconState;
@@ -50,6 +50,7 @@ const TABS: { id: TabId; label: string }[] = [
   { id: "keys", label: "API keys" },
   { id: "transcribe", label: "Transcribe" },
   { id: "postprocess", label: "Post-process" },
+  { id: "stats", label: "Stats" },
   { id: "output", label: "Output" },
 ];
 
@@ -111,7 +112,9 @@ type TranscriptionHistoryEntry = {
   createdAt: number;
   transcript: string;
   processed: string;
+  silenceDetected: boolean;
   transcriptChars: number;
+  audioDurationSec: number | null;
   transcribeMs: number;
   postprocessMs: number | null;
   prePostprocessMs: number | null;
@@ -121,12 +124,20 @@ type TranscriptionHistoryEntry = {
   hotkeyPostApiToPasteMs: number | null;
   hotkeyPasteChordMs: number | null;
   totalMs: number;
+  asrMetadata: Record<string, unknown> | null;
 };
 
 function numOrNull(v: unknown): number | null {
   if (v === null || v === undefined) return null;
   const n = Number(v);
   return Number.isFinite(n) ? n : null;
+}
+
+function objectOrNull(v: unknown): Record<string, unknown> | null {
+  if (v && typeof v === "object" && !Array.isArray(v)) {
+    return v as Record<string, unknown>;
+  }
+  return null;
 }
 
 function mapHistoryEntry(raw: Record<string, unknown>): TranscriptionHistoryEntry {
@@ -141,12 +152,17 @@ function mapHistoryEntry(raw: Record<string, unknown>): TranscriptionHistoryEntr
   const id =
     typeof idRaw === "string" && idRaw.length > 0 ? idRaw : `legacy-${createdAt}`;
   const ppRaw = raw.postprocess_ms ?? raw.postprocessMs;
+  const asrMetadata = objectOrNull(raw.asr_metadata ?? raw.asrMetadata);
   return {
     id,
     createdAt: Number.isFinite(createdAt) ? createdAt : Date.now(),
     transcript: String(raw.transcript ?? ""),
     processed: String(raw.processed ?? ""),
+    silenceDetected: Boolean(raw.silence_detected ?? raw.silenceDetected ?? false),
     transcriptChars: Number(raw.transcript_chars ?? raw.transcriptChars ?? 0),
+    audioDurationSec:
+      numOrNull(raw.audio_duration_sec ?? raw.audioDurationSec) ??
+      numOrNull(asrMetadata?.duration),
     transcribeMs: Number(raw.transcribe_ms ?? raw.transcribeMs ?? 0),
     postprocessMs:
       ppRaw === null || ppRaw === undefined ? null : Number(ppRaw),
@@ -159,6 +175,7 @@ function mapHistoryEntry(raw: Record<string, unknown>): TranscriptionHistoryEntr
     ),
     hotkeyPasteChordMs: numOrNull(raw.hotkey_paste_chord_ms ?? raw.hotkeyPasteChordMs),
     totalMs: Number(raw.total_ms ?? raw.totalMs ?? 0),
+    asrMetadata,
   };
 }
 
@@ -207,6 +224,184 @@ function historyTimingHotkeyLine(e: TranscriptionHistoryEntry): string | null {
     p.push(`paste chord ${formatDurationMs(e.hotkeyPasteChordMs)}`);
   }
   return p.length ? `Hotkey: ${p.join(" · ")}` : null;
+}
+
+type StatsSummary = {
+  transcriptionCount: number;
+  timedEntryCount: number;
+  totalAudioSec: number;
+  totalChars: number;
+  totalWords: number;
+  totalTranscribeMs: number;
+  totalCostUsd: number | null;
+  costEntryCount: number;
+  firstAt: number | null;
+  lastAt: number | null;
+  averageWordsPerEntry: number;
+  averageSpeechWpm: number | null;
+  apiThroughputWpm: number | null;
+  averageApiSeconds: number | null;
+  longestAudioSec: number | null;
+  recent: {
+    id: string;
+    label: string;
+    words: number;
+    audioSec: number | null;
+    wpm: number | null;
+  }[];
+};
+
+function countWords(text: string): number {
+  const matches = text.trim().match(/[\p{L}\p{N}]+(?:['’.-][\p{L}\p{N}]+)*/gu);
+  return matches?.length ?? 0;
+}
+
+function formatNumber(n: number): string {
+  return Number.isFinite(n) ? Math.round(n).toLocaleString() : "—";
+}
+
+function formatDecimal(n: number | null, digits = 1): string {
+  if (n == null || !Number.isFinite(n)) return "—";
+  return n.toLocaleString(undefined, {
+    minimumFractionDigits: digits,
+    maximumFractionDigits: digits,
+  });
+}
+
+function formatAudioDuration(seconds: number | null): string {
+  if (seconds == null || !Number.isFinite(seconds) || seconds <= 0) return "—";
+  const minutes = seconds / 60;
+  if (minutes < 60) return `${formatDecimal(minutes, minutes < 10 ? 1 : 0)} min`;
+  const hours = minutes / 60;
+  return `${formatDecimal(hours, hours < 10 ? 2 : 1)} hr`;
+}
+
+function formatAudioDurationDetail(seconds: number): string {
+  if (!Number.isFinite(seconds) || seconds <= 0) return "0 min · 0 hr";
+  const minutes = seconds / 60;
+  const hours = minutes / 60;
+  return `${formatDecimal(minutes, minutes < 10 ? 1 : 0)} min · ${formatDecimal(hours, 2)} hr`;
+}
+
+function formatCostUsd(cost: number | null): string {
+  if (cost == null || !Number.isFinite(cost)) return "Unavailable";
+  if (cost === 0) return "$0.00";
+  if (cost < 0.01) return `$${cost.toFixed(4)}`;
+  if (cost < 1) return `$${cost.toFixed(3)}`;
+  return cost.toLocaleString(undefined, {
+    style: "currency",
+    currency: "USD",
+    maximumFractionDigits: 2,
+  });
+}
+
+function costNumber(v: unknown): number | null {
+  if (typeof v === "number" && Number.isFinite(v)) return v;
+  if (typeof v === "string") {
+    const n = Number(v.replace(/[$,]/g, "").trim());
+    return Number.isFinite(n) ? n : null;
+  }
+  return null;
+}
+
+function costFromObject(obj: Record<string, unknown> | null): number | null {
+  if (!obj) return null;
+  for (const key of ["total_cost", "totalCost", "cost", "total_price", "totalPrice"]) {
+    const n = costNumber(obj[key]);
+    if (n != null) return n;
+  }
+  const usage = objectOrNull(obj.usage);
+  if (usage) {
+    for (const key of ["total_cost", "totalCost", "cost", "total_price", "totalPrice"]) {
+      const n = costNumber(usage[key]);
+      if (n != null) return n;
+    }
+  }
+  return null;
+}
+
+function computeStats(entries: TranscriptionHistoryEntry[]): StatsSummary {
+  let totalAudioSec = 0;
+  let totalChars = 0;
+  let totalWords = 0;
+  let timedWords = 0;
+  let timedEntryCount = 0;
+  let totalTranscribeMs = 0;
+  let totalCostUsd = 0;
+  let costEntryCount = 0;
+  let firstAt: number | null = null;
+  let lastAt: number | null = null;
+  let longestAudioSec: number | null = null;
+
+  const recent = entries.slice(0, 8).map((entry) => {
+    const text = entry.silenceDetected ? "" : entry.transcript;
+    const words = countWords(text);
+    const audioSec = entry.audioDurationSec;
+    const wpm =
+      audioSec != null && audioSec > 0 && words > 0 ? words / (audioSec / 60) : null;
+    return {
+      id: entry.id,
+      label: new Date(entry.createdAt).toLocaleDateString(undefined, {
+        month: "short",
+        day: "numeric",
+      }),
+      words,
+      audioSec,
+      wpm,
+    };
+  });
+
+  for (const entry of entries) {
+    const text = entry.silenceDetected ? "" : entry.transcript;
+    const chars = entry.transcriptChars || text.length;
+    const words = countWords(text);
+    totalChars += chars;
+    totalWords += words;
+    if (entry.audioDurationSec != null && entry.audioDurationSec > 0) {
+      totalAudioSec += entry.audioDurationSec;
+      timedWords += words;
+      timedEntryCount += 1;
+      longestAudioSec =
+        longestAudioSec == null
+          ? entry.audioDurationSec
+          : Math.max(longestAudioSec, entry.audioDurationSec);
+    }
+    if (Number.isFinite(entry.transcribeMs) && entry.transcribeMs > 0) {
+      totalTranscribeMs += entry.transcribeMs;
+    }
+    const cost = costFromObject(entry.asrMetadata);
+    if (cost != null) {
+      totalCostUsd += cost;
+      costEntryCount += 1;
+    }
+    firstAt = firstAt == null ? entry.createdAt : Math.min(firstAt, entry.createdAt);
+    lastAt = lastAt == null ? entry.createdAt : Math.max(lastAt, entry.createdAt);
+  }
+
+  const transcriptionCount = entries.length;
+  return {
+    transcriptionCount,
+    timedEntryCount,
+    totalAudioSec,
+    totalChars,
+    totalWords,
+    totalTranscribeMs,
+    totalCostUsd: costEntryCount > 0 ? totalCostUsd : null,
+    costEntryCount,
+    firstAt,
+    lastAt,
+    averageWordsPerEntry: transcriptionCount > 0 ? totalWords / transcriptionCount : 0,
+    averageSpeechWpm:
+      totalAudioSec > 0 && timedWords > 0 ? timedWords / (totalAudioSec / 60) : null,
+    apiThroughputWpm:
+      totalTranscribeMs > 0 && totalWords > 0 ? totalWords / (totalTranscribeMs / 60000) : null,
+    averageApiSeconds:
+      transcriptionCount > 0 && totalTranscribeMs > 0
+        ? totalTranscribeMs / transcriptionCount / 1000
+        : null,
+    longestAudioSec,
+    recent,
+  };
 }
 
 const defaultPrefs = (): AppPreferences => ({
@@ -541,7 +736,7 @@ export function App() {
   }, [keywordRows, hydrated, setPref]);
 
   useEffect(() => {
-    if (activeTab !== "output" || !hydrated) return;
+    if ((activeTab !== "output" && activeTab !== "stats") || !hydrated) return;
     const refresh = async () => {
       try {
         const hist = await apiJson<{ entries: Record<string, unknown>[] }>(
@@ -816,6 +1011,10 @@ export function App() {
   const hotkeyDiagnostics = runtimeState?.hotkey;
   const hotkeyConflict = hotkeyConflictWarning(prefs.hotkey_toggle_recording);
   const osIconStatus = runtimeState?.os_icon;
+  const stats = useMemo(
+    () => computeStats(transcriptionHistory),
+    [transcriptionHistory],
+  );
   const audioInputSelection = prefs.audio_input_device || audioInputIds.builtin;
   const selectedAudioInputKnown =
     audioInputSelection === audioInputIds.builtin ||
@@ -1692,6 +1891,120 @@ export function App() {
                 ignored or rejected by the provider.
               </p>
             </div>
+          </div>
+          )}
+
+          {activeTab === "stats" && (
+          <div
+            id="panel-stats"
+            role="tabpanel"
+            aria-labelledby="tab-stats"
+          >
+            <h2 className="section-title">Transcription stats</h2>
+            <p className="muted output-hint">
+              Totals come from local transcription history. Cost appears only when the provider
+              returned a usable cost field.
+            </p>
+            {stats.transcriptionCount === 0 ? (
+              <p className="muted">No transcriptions yet. Record and transcribe from the Transcribe tab.</p>
+            ) : (
+              <div className="stats-panel">
+                <div className="stats-hero-grid">
+                  <div className="stats-card stats-card--wide">
+                    <span className="stats-label">Audio transcribed</span>
+                    <strong>{formatAudioDuration(stats.totalAudioSec)}</strong>
+                    <span className="stats-detail">{formatAudioDurationDetail(stats.totalAudioSec)}</span>
+                  </div>
+                  <div className="stats-card">
+                    <span className="stats-label">Transcriptions</span>
+                    <strong>{formatNumber(stats.transcriptionCount)}</strong>
+                    <span className="stats-detail">
+                      {stats.firstAt != null && stats.lastAt != null
+                        ? `${new Date(stats.firstAt).toLocaleDateString()} → ${new Date(
+                            stats.lastAt,
+                          ).toLocaleDateString()}`
+                        : "Local history"}
+                    </span>
+                  </div>
+                  <div className="stats-card">
+                    <span className="stats-label">Words</span>
+                    <strong>{formatNumber(stats.totalWords)}</strong>
+                    <span className="stats-detail">
+                      {formatDecimal(stats.averageWordsPerEntry, 1)} avg each
+                    </span>
+                  </div>
+                  <div className="stats-card">
+                    <span className="stats-label">Characters</span>
+                    <strong>{formatNumber(stats.totalChars)}</strong>
+                    <span className="stats-detail">Raw transcript text</span>
+                  </div>
+                  <div className="stats-card stats-card--accent">
+                    <span className="stats-label">Avg speech pace</span>
+                    <strong>{formatDecimal(stats.averageSpeechWpm, 1)}</strong>
+                    <span className="stats-detail">words per audio minute</span>
+                  </div>
+                  <div className="stats-card">
+                    <span className="stats-label">API throughput</span>
+                    <strong>{formatDecimal(stats.apiThroughputWpm, 0)}</strong>
+                    <span className="stats-detail">words per processing minute</span>
+                  </div>
+                  <div className="stats-card">
+                    <span className="stats-label">Total cost</span>
+                    <strong>{formatCostUsd(stats.totalCostUsd)}</strong>
+                    <span className="stats-detail">
+                      {stats.costEntryCount > 0
+                        ? `${stats.costEntryCount.toLocaleString()} entries with cost`
+                        : "Provider did not return cost"}
+                    </span>
+                  </div>
+                </div>
+
+                <div className="stats-insight-grid">
+                  <div className="stats-insight">
+                    <span className="stats-label">Average API wait</span>
+                    <strong>
+                      {stats.averageApiSeconds == null
+                        ? "—"
+                        : `${formatDecimal(stats.averageApiSeconds, 2)} s`}
+                    </strong>
+                  </div>
+                  <div className="stats-insight">
+                    <span className="stats-label">Longest audio</span>
+                    <strong>{formatAudioDuration(stats.longestAudioSec)}</strong>
+                  </div>
+                  <div className="stats-insight">
+                    <span className="stats-label">Known audio coverage</span>
+                    <strong>
+                      {stats.timedEntryCount > 0
+                        ? `${stats.timedEntryCount.toLocaleString()} / ${stats.transcriptionCount.toLocaleString()} entries`
+                        : "Missing from older entries"}
+                    </strong>
+                  </div>
+                </div>
+
+                <div className="stats-recent">
+                  <h3>Recent word volume</h3>
+                  <ul className="stats-bars" aria-label="Recent transcription word counts">
+                    {stats.recent.map((item) => {
+                      const maxWords = Math.max(1, ...stats.recent.map((x) => x.words));
+                      const width = Math.max(4, Math.round((item.words / maxWords) * 100));
+                      return (
+                        <li key={item.id} className="stats-bar-row">
+                          <span className="stats-bar-label">{item.label}</span>
+                          <span className="stats-bar-track" aria-hidden>
+                            <span className="stats-bar-fill" style={{ width: `${width}%` }} />
+                          </span>
+                          <span className="stats-bar-value">
+                            {item.words.toLocaleString()} words
+                            {item.wpm != null ? ` · ${formatDecimal(item.wpm, 0)} wpm` : ""}
+                          </span>
+                        </li>
+                      );
+                    })}
+                  </ul>
+                </div>
+              </div>
+            )}
           </div>
           )}
 
