@@ -54,6 +54,11 @@ pub const kCGEventMaskForAllEvents: u64 = (1 << CGEventType::LeftMouseDown as u6
     + (1 << CGEventType::FlagsChanged as u64)
     + (1 << CGEventType::ScrollWheel as u64);
 
+#[allow(non_upper_case_globals)]
+pub const kCGEventMaskForKeyboardEvents: u64 = (1 << CGEventType::KeyDown as u64)
+    + (1 << CGEventType::KeyUp as u64)
+    + (1 << CGEventType::FlagsChanged as u64);
+
 #[cfg(target_os = "macos")]
 #[link(name = "Cocoa", kind = "framework")]
 extern "C" {
@@ -79,6 +84,7 @@ extern "C" {
     pub static kCFRunLoopCommonModes: CFRunLoopMode;
 
 }
+#[allow(improper_ctypes_definitions)]
 pub type QCallback = unsafe extern "C" fn(
     proxy: CGEventTapProxy,
     _type: CGEventType,

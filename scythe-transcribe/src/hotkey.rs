@@ -1,16 +1,21 @@
 //! Global hold-to-record hotkey (rdev + cpal), clipboard paste, runtime icon updates.
 
-use std::cell::RefCell;
 use std::collections::HashMap;
 use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::mpsc;
 use std::sync::{Arc, Mutex, OnceLock};
 use std::thread;
 use std::time::{Duration, Instant};
 
 use cpal::traits::{DeviceTrait, HostTrait, StreamTrait};
-use cpal::{Sample, SampleFormat};
+use cpal::{Device, Sample, SampleFormat};
 use once_cell::sync::Lazy;
-use rdev::{listen, simulate, Event, EventType, Key};
+#[cfg(not(target_os = "macos"))]
+use rdev::listen as listen_hotkey_events;
+#[cfg(target_os = "macos")]
+use rdev::listen_keyboard as listen_hotkey_events;
+use rdev::{simulate, Event, EventType, Key};
+use serde::Serialize;
 use serde_json::{json, Value};
 
 use crate::pipeline::{
@@ -36,6 +41,18 @@ static TOKIO: Lazy<tokio::runtime::Runtime> = Lazy::new(|| {
 });
 
 const MODIFIERS: &[&str] = &["ctrl", "alt", "shift", "meta"];
+const HOTKEY_CONFIG_RELOAD_INTERVAL: Duration = Duration::from_millis(500);
+const HOTKEY_WATCHDOG_INTERVAL: Duration = Duration::from_millis(100);
+pub const AUDIO_INPUT_BUILT_IN: &str = "__builtin_microphone__";
+pub const AUDIO_INPUT_SYSTEM_DEFAULT: &str = "__system_default__";
+
+#[derive(Clone, Debug, Serialize)]
+pub struct AudioInputDeviceInfo {
+    pub id: String,
+    pub name: String,
+    pub is_default: bool,
+    pub is_builtin_candidate: bool,
+}
 
 fn normalize_part(p: &str) -> String {
     let p = p.trim().to_lowercase();
@@ -134,10 +151,74 @@ fn combo_requirements_met(counts: &HashMap<String, i32>, combo_parts: &[String])
         .all(|p| *counts.get(p).unwrap_or(&0) >= 1)
 }
 
+fn combo_contains_token(combo_parts: &[String], tok: &str) -> bool {
+    combo_parts.iter().any(|p| p == tok)
+}
+
 fn update_status(f: impl FnOnce(&mut Value)) {
     if let Ok(mut g) = STATUS.lock() {
         f(&mut g);
     }
+}
+
+fn is_builtin_input_name(name: &str) -> bool {
+    let lower = name.to_lowercase();
+    lower.contains("built-in microphone")
+        || lower.contains("built in microphone")
+        || lower.contains("macbook pro microphone")
+        || lower.contains("macbook air microphone")
+        || lower.contains("imac microphone")
+}
+
+pub fn audio_input_devices() -> Vec<AudioInputDeviceInfo> {
+    let host = cpal::default_host();
+    let default_name = host.default_input_device().and_then(|d| d.name().ok());
+    let mut devices = Vec::new();
+    if let Ok(input_devices) = host.input_devices() {
+        for device in input_devices {
+            let Ok(name) = device.name() else {
+                continue;
+            };
+            devices.push(AudioInputDeviceInfo {
+                id: name.clone(),
+                is_default: default_name.as_deref() == Some(name.as_str()),
+                is_builtin_candidate: is_builtin_input_name(&name),
+                name,
+            });
+        }
+    }
+    devices
+}
+
+fn find_named_input_device(host: &cpal::Host, name: &str) -> Option<Device> {
+    let input_devices = host.input_devices().ok()?;
+    input_devices
+        .filter_map(|device| {
+            let device_name = device.name().ok()?;
+            Some((device_name, device))
+        })
+        .find_map(|(device_name, device)| (device_name == name).then_some(device))
+}
+
+fn find_builtin_input_device(host: &cpal::Host) -> Option<Device> {
+    let input_devices = host.input_devices().ok()?;
+    input_devices
+        .filter_map(|device| {
+            let device_name = device.name().ok()?;
+            Some((device_name, device))
+        })
+        .find_map(|(device_name, device)| is_builtin_input_name(&device_name).then_some(device))
+}
+
+fn select_input_device(host: &cpal::Host, configured: &str) -> Option<Device> {
+    let configured = configured.trim();
+    if configured == AUDIO_INPUT_BUILT_IN {
+        return find_builtin_input_device(host).or_else(|| host.default_input_device());
+    }
+    if configured.is_empty() || configured == AUDIO_INPUT_SYSTEM_DEFAULT {
+        return host.default_input_device();
+    }
+    find_named_input_device(host, configured).or_else(|| host.default_input_device())
 }
 
 fn set_capture_state(state: &str) {
@@ -181,26 +262,84 @@ fn float32_mono_to_wav_bytes(samples: &[f32], sample_rate: u32) -> Vec<u8> {
 }
 
 struct AudioCapture {
-    _stream: cpal::Stream,
+    stop_tx: mpsc::Sender<()>,
+    join: Option<thread::JoinHandle<()>>,
     samples: Arc<Mutex<Vec<f32>>>,
     sample_rate: u32,
 }
 
 impl AudioCapture {
     fn start() -> Result<Self, String> {
-        let host = cpal::default_host();
-        let device = host
-            .default_input_device()
-            .ok_or_else(|| "no input device".to_string())?;
-        let cfg = device.default_input_config().map_err(|e| e.to_string())?;
-        let sample_rate = cfg.sample_rate().0;
+        let prefs = load_preferences();
         let samples = Arc::new(Mutex::new(Vec::<f32>::new()));
-        let samples2 = samples.clone();
+        let samples_thread = samples.clone();
+        let (ready_tx, ready_rx) = mpsc::sync_channel::<Result<u32, String>>(1);
+        let (stop_tx, stop_rx) = mpsc::channel::<()>();
 
-        let stream = match cfg.sample_format() {
-            SampleFormat::F32 => device
+        let join = thread::spawn(move || {
+            let result = (|| {
+                let host = cpal::default_host();
+                let device = select_input_device(&host, &prefs.audio_input_device)
+                    .ok_or_else(|| "no input device".to_string())?;
+                let cfg = device.default_input_config().map_err(|e| e.to_string())?;
+                let sample_rate = cfg.sample_rate().0;
+                let stream_config = cfg.clone().into();
+                let stream = build_input_stream(
+                    &device,
+                    &stream_config,
+                    cfg.sample_format(),
+                    samples_thread,
+                )?;
+                stream.play().map_err(|e| e.to_string())?;
+                Ok((sample_rate, stream))
+            })();
+
+            match result {
+                Ok((sample_rate, stream)) => {
+                    let _ = ready_tx.send(Ok(sample_rate));
+                    let _stream = stream;
+                    let _ = stop_rx.recv();
+                }
+                Err(e) => {
+                    let _ = ready_tx.send(Err(e));
+                }
+            }
+        });
+
+        let sample_rate = ready_rx
+            .recv()
+            .map_err(|_| "audio capture thread stopped".to_string())??;
+        Ok(Self {
+            stop_tx,
+            join: Some(join),
+            samples,
+            sample_rate,
+        })
+    }
+
+    fn stop(mut self) -> (Vec<f32>, u32) {
+        let _ = self.stop_tx.send(());
+        if let Some(join) = self.join.take() {
+            let _ = join.join();
+        }
+        let rate = self.sample_rate;
+        let v = self.samples.lock().map(|g| g.clone()).unwrap_or_default();
+        (v, rate)
+    }
+}
+
+fn build_input_stream(
+    device: &Device,
+    cfg: &cpal::StreamConfig,
+    sample_format: SampleFormat,
+    samples: Arc<Mutex<Vec<f32>>>,
+) -> Result<cpal::Stream, String> {
+    match sample_format {
+        SampleFormat::F32 => {
+            let samples2 = samples.clone();
+            device
                 .build_input_stream(
-                    &cfg.into(),
+                    cfg,
                     move |data: &[f32], _| {
                         if let Ok(mut g) = samples2.lock() {
                             for s in data.iter().cloned() {
@@ -211,10 +350,13 @@ impl AudioCapture {
                     |_e| {},
                     None,
                 )
-                .map_err(|e| e.to_string())?,
-            SampleFormat::I16 => device
+                .map_err(|e| e.to_string())
+        }
+        SampleFormat::I16 => {
+            let samples2 = samples.clone();
+            device
                 .build_input_stream(
-                    &cfg.into(),
+                    cfg,
                     move |data: &[i16], _| {
                         if let Ok(mut g) = samples2.lock() {
                             for s in data.iter().cloned() {
@@ -225,35 +367,23 @@ impl AudioCapture {
                     |_e| {},
                     None,
                 )
-                .map_err(|e| e.to_string())?,
-            SampleFormat::U16 => device
-                .build_input_stream(
-                    &cfg.into(),
-                    move |data: &[u16], _| {
-                        if let Ok(mut g) = samples2.lock() {
-                            for s in data {
-                                g.push((*s as f32 / 32768.0) - 1.0);
-                            }
+                .map_err(|e| e.to_string())
+        }
+        SampleFormat::U16 => device
+            .build_input_stream(
+                cfg,
+                move |data: &[u16], _| {
+                    if let Ok(mut g) = samples.lock() {
+                        for s in data {
+                            g.push((*s as f32 / 32768.0) - 1.0);
                         }
-                    },
-                    |_e| {},
-                    None,
-                )
-                .map_err(|e| e.to_string())?,
-            _ => return Err("unsupported sample format".to_string()),
-        };
-        stream.play().map_err(|e| e.to_string())?;
-        Ok(Self {
-            _stream: stream,
-            samples,
-            sample_rate,
-        })
-    }
-
-    fn stop(self) -> (Vec<f32>, u32) {
-        let rate = self.sample_rate;
-        let v = self.samples.lock().map(|g| g.clone()).unwrap_or_default();
-        (v, rate)
+                    }
+                },
+                |_e| {},
+                None,
+            )
+            .map_err(|e| e.to_string()),
+        _ => Err("unsupported sample format".to_string()),
     }
 }
 
@@ -287,7 +417,9 @@ fn paste_at_cursor(text: &str, suppress_until: &Arc<Mutex<Instant>>) {
 }
 
 struct HotkeyState {
+    configured_combo: String,
     combo_parts: Vec<String>,
+    config_loaded_at: Instant,
     counts: HashMap<String, i32>,
     prev_active: bool,
     recording: Option<AudioCapture>,
@@ -295,6 +427,47 @@ struct HotkeyState {
 }
 
 impl HotkeyState {
+    fn new_from_preferences() -> Self {
+        let configured_combo = load_preferences().hotkey_toggle_recording;
+        let combo_parts = parse_hotkey_combo(&configured_combo);
+        Self {
+            configured_combo,
+            combo_parts,
+            config_loaded_at: Instant::now(),
+            counts: HashMap::new(),
+            prev_active: false,
+            recording: None,
+            event_count: 0,
+        }
+    }
+
+    fn refresh_config_if_due(&mut self, now: Instant) {
+        if now.saturating_duration_since(self.config_loaded_at) < HOTKEY_CONFIG_RELOAD_INTERVAL {
+            return;
+        }
+        self.config_loaded_at = now;
+
+        if self.recording.is_some() {
+            return;
+        }
+
+        let configured_combo = load_preferences().hotkey_toggle_recording;
+        if configured_combo == self.configured_combo {
+            return;
+        }
+
+        self.configured_combo = configured_combo;
+        self.combo_parts = parse_hotkey_combo(&self.configured_combo);
+        self.counts.clear();
+        self.prev_active = false;
+        update_status(|s| {
+            s["configured_combo"] = json!(self.configured_combo);
+            s["combo_parts"] = json!(self.combo_parts);
+            s["pressed_tokens"] = json!(Vec::<String>::new());
+            s["combo_active"] = json!(false);
+        });
+    }
+
     fn record_event(
         &mut self,
         ev_name: &str,
@@ -307,7 +480,7 @@ impl HotkeyState {
             let is_mod = MODIFIERS.contains(&t.as_str());
             if is_mod {
                 if ev_name == "press" {
-                    *self.counts.entry(t.clone()).or_insert(0) += 1;
+                    self.counts.insert(t.clone(), 1);
                 } else if let Some(v) = self.counts.get_mut(t) {
                     *v -= 1;
                     if *v <= 0 {
@@ -385,9 +558,49 @@ fn transcribe_wav_on_thread(
     });
 }
 
-fn hotkey_on_press(st: &mut HotkeyState, tok: Option<Key>, configured: &str, now: f64) {
-    let tok = tok.and_then(key_token).map(str::to_string);
+fn finish_recording(
+    st: &mut HotkeyState,
+    now: f64,
+    transcribing: &Arc<AtomicBool>,
+    suppress_until: &Arc<Mutex<Instant>>,
+    clear_pressed_state: bool,
+) {
+    let cap = st.recording.take();
+    st.prev_active = false;
+    if clear_pressed_state {
+        st.counts.clear();
+        update_status(|s| {
+            s["pressed_tokens"] = json!(Vec::<String>::new());
+            s["combo_active"] = json!(false);
+        });
+    }
+    update_status(|s| {
+        s["last_recording_stopped_at"] = json!(now);
+    });
+    let (samples, rate) = if let Some(c) = cap {
+        c.stop()
+    } else {
+        (Vec::new(), 16_000)
+    };
+    let min_samps = (rate as usize * 12) / 100;
+    if samples.len() >= min_samps
+        && transcribing
+            .compare_exchange(false, true, Ordering::SeqCst, Ordering::SeqCst)
+            .is_ok()
+    {
+        set_capture_state("processing");
+        runtime_icon::set_icon_state(ICON_PROCESSING);
+        let wav = float32_mono_to_wav_bytes(&samples, rate);
+        let tr = transcribing.clone();
+        let sup = suppress_until.clone();
+        transcribe_wav_on_thread(wav, tr, sup);
+    } else {
+        set_capture_state("idle");
+        runtime_icon::set_icon_state(ICON_IDLE);
+    }
+}
 
+fn hotkey_on_press(st: &mut HotkeyState, tok: Option<String>, configured: &str, now: f64) {
     if tok.is_none() {
         st.record_event("press", &None, configured, now);
         return;
@@ -426,14 +639,12 @@ fn hotkey_on_press(st: &mut HotkeyState, tok: Option<Key>, configured: &str, now
 
 fn hotkey_on_release(
     st: &mut HotkeyState,
-    tok: Option<Key>,
+    tok: Option<String>,
     configured: &str,
     now: f64,
     transcribing: &Arc<AtomicBool>,
     suppress_until: &Arc<Mutex<Instant>>,
 ) {
-    let tok = tok.and_then(key_token).map(str::to_string);
-
     if tok.is_none() {
         st.record_event("release", &None, configured, now);
         return;
@@ -453,85 +664,97 @@ fn hotkey_on_release(
         return;
     }
 
-    let cap = st.recording.take();
-    update_status(|s| {
-        s["last_recording_stopped_at"] = json!(now);
-    });
-    let (samples, rate) = if let Some(c) = cap {
-        c.stop()
-    } else {
-        (Vec::new(), 16_000)
-    };
-    let min_samps = (rate as usize * 12) / 100;
-    if samples.len() >= min_samps
-        && transcribing
-            .compare_exchange(false, true, Ordering::SeqCst, Ordering::SeqCst)
-            .is_ok()
-    {
-        set_capture_state("processing");
-        runtime_icon::set_icon_state(ICON_PROCESSING);
-        let wav = float32_mono_to_wav_bytes(&samples, rate);
-        let tr = transcribing.clone();
-        let sup = suppress_until.clone();
-        transcribe_wav_on_thread(wav, tr, sup);
-    } else {
-        set_capture_state("idle");
-        runtime_icon::set_icon_state(ICON_IDLE);
-    }
+    finish_recording(st, now, transcribing, suppress_until, false);
 }
 
 fn run_hotkey_loop() {
     let transcribing = Arc::new(AtomicBool::new(false));
     let suppress_until = Arc::new(Mutex::new(Instant::now()));
 
-    let state = RefCell::new(HotkeyState {
-        combo_parts: Vec::new(),
-        counts: HashMap::new(),
-        prev_active: false,
-        recording: None,
-        event_count: 0,
-    });
+    let state = Arc::new(Mutex::new(HotkeyState::new_from_preferences()));
 
     set_capture_state("idle");
     runtime_icon::set_icon_state(ICON_IDLE);
 
     let transcribing_cb = transcribing.clone();
     let suppress_cb = suppress_until.clone();
+    let state_watchdog = state.clone();
+    let transcribing_watchdog = transcribing.clone();
+    let suppress_watchdog = suppress_until.clone();
 
-    let callback = move |event: Event| {
-        if Instant::now() < suppress_cb.lock().map(|g| *g).unwrap_or(Instant::now()) {
-            return;
+    thread::spawn(move || loop {
+        thread::sleep(HOTKEY_WATCHDOG_INTERVAL);
+        let Ok(mut st) = state_watchdog.lock() else {
+            continue;
+        };
+        if st.recording.is_none() {
+            continue;
         }
-        if transcribing_cb.load(Ordering::SeqCst) {
-            return;
+        if crate::macos::hotkey_combo_physically_pressed(&st.combo_parts).unwrap_or(true) {
+            continue;
         }
-
-        let prefs = load_preferences();
-        let configured = prefs.hotkey_toggle_recording.clone();
-        let parts = parse_hotkey_combo(&configured);
-
-        let mut st = state.borrow_mut();
-        st.combo_parts = parts;
-
         let now = std::time::SystemTime::now()
             .duration_since(std::time::UNIX_EPOCH)
             .map(|d| d.as_secs_f64())
             .unwrap_or(0.0);
+        finish_recording(
+            &mut st,
+            now,
+            &transcribing_watchdog,
+            &suppress_watchdog,
+            true,
+        );
+    });
 
+    let callback = move |event: Event| {
         let (ev_name, key_opt) = match event.event_type {
             EventType::KeyPress(k) => ("press", Some(k)),
             EventType::KeyRelease(k) => ("release", Some(k)),
             _ => return,
         };
+        let tok = key_opt.and_then(key_token).map(str::to_string);
+
+        let instant_now = Instant::now();
+        let is_suppressed = instant_now < suppress_cb.lock().map(|g| *g).unwrap_or(instant_now);
+        let is_transcribing = transcribing_cb.load(Ordering::SeqCst);
+
+        let Ok(mut st) = state.lock() else {
+            return;
+        };
+        st.refresh_config_if_due(instant_now);
+        if st.combo_parts.is_empty() {
+            return;
+        }
+        if !tok
+            .as_deref()
+            .is_some_and(|t| combo_contains_token(&st.combo_parts, t))
+        {
+            return;
+        }
+
+        let now = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map(|d| d.as_secs_f64())
+            .unwrap_or(0.0);
+        let configured = st.configured_combo.clone();
 
         if ev_name == "press" {
-            hotkey_on_press(&mut st, key_opt, &configured, now);
+            if is_suppressed || is_transcribing {
+                return;
+            }
+            hotkey_on_press(&mut st, tok, &configured, now);
+            return;
+        }
+
+        if is_suppressed || is_transcribing {
+            st.record_event("release", &tok, &configured, now);
+            st.prev_active = combo_requirements_met(&st.counts, &st.combo_parts);
             return;
         }
 
         hotkey_on_release(
             &mut st,
-            key_opt,
+            tok,
             &configured,
             now,
             &transcribing_cb,
@@ -539,7 +762,7 @@ fn run_hotkey_loop() {
         );
     };
 
-    let _ = listen(callback);
+    let _ = listen_hotkey_events(callback);
 }
 
 fn manager_loop() {
@@ -592,10 +815,7 @@ pub fn get_hotkey_listener_status() -> Value {
                 "microphone_authorized".to_string(),
                 json!(mic.is_authorized()),
             );
-            obj.insert(
-                "microphone_authorization".to_string(),
-                json!(mic.as_str()),
-            );
+            obj.insert("microphone_authorization".to_string(), json!(mic.as_str()));
         }
         #[cfg(not(target_os = "macos"))]
         {

@@ -83,13 +83,49 @@ export type MicSession = {
   stop: () => Promise<Blob>;
 };
 
+async function getPreferredBrowserAudioConstraints(
+  preferredDevice: string,
+): Promise<MediaStreamConstraints["audio"]> {
+  const preferred = preferredDevice.trim().toLowerCase();
+  if (
+    !preferred ||
+    preferred === "__system_default__" ||
+    !navigator.mediaDevices?.enumerateDevices
+  ) {
+    return true;
+  }
+
+  const devices = await navigator.mediaDevices.enumerateDevices();
+  const inputs = devices.filter((d) => d.kind === "audioinput");
+  const isBuiltIn = preferred === "__builtin_microphone__";
+  const selected = inputs.find((d) => {
+    const label = d.label.toLowerCase();
+    if (isBuiltIn) {
+      return (
+        label.includes("built-in microphone") ||
+        label.includes("built in microphone") ||
+        label.includes("macbook pro microphone") ||
+        label.includes("macbook air microphone") ||
+        label.includes("imac microphone")
+      );
+    }
+    return label === preferred || label.includes(preferred);
+  });
+
+  if (!selected?.deviceId) {
+    return true;
+  }
+  return { deviceId: { exact: selected.deviceId } };
+}
+
 /**
- * Start recording from the default microphone.
+ * Start recording from the selected microphone when the browser can match it.
  *
  * Uses ScriptProcessorNode (deprecated but widely supported) to collect PCM.
  */
-export async function startMicRecording(): Promise<MicSession> {
-  const stream = await navigator.mediaDevices.getUserMedia({ audio: true });
+export async function startMicRecording(preferredDevice = ""): Promise<MicSession> {
+  const audio = await getPreferredBrowserAudioConstraints(preferredDevice);
+  const stream = await navigator.mediaDevices.getUserMedia({ audio });
   const audioCtx = new AudioContext();
   const inputRate = audioCtx.sampleRate;
   const source = audioCtx.createMediaStreamSource(stream);

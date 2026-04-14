@@ -18,15 +18,15 @@ type OptionBits = c_uint;
 static kUCKeyTranslateDeadKeysBit: OptionBits = 1 << 31;
 #[allow(non_upper_case_globals)]
 static kUCKeyActionDown: u16 = 0;
-#[allow(non_upper_case_globals)]
+#[allow(dead_code, non_upper_case_globals)]
 static NSEventModifierFlagCapsLock: u64 = 1 << 16;
-#[allow(non_upper_case_globals)]
+#[allow(dead_code, non_upper_case_globals)]
 static NSEventModifierFlagShift: u64 = 1 << 17;
-#[allow(non_upper_case_globals)]
+#[allow(dead_code, non_upper_case_globals)]
 static NSEventModifierFlagControl: u64 = 1 << 18;
-#[allow(non_upper_case_globals)]
+#[allow(dead_code, non_upper_case_globals)]
 static NSEventModifierFlagOption: u64 = 1 << 19;
-#[allow(non_upper_case_globals)]
+#[allow(dead_code, non_upper_case_globals)]
 static NSEventModifierFlagCommand: u64 = 1 << 20;
 
 const BUF_LEN: usize = 4;
@@ -77,6 +77,7 @@ impl Keyboard {
         }
     }
 
+    #[allow(dead_code)]
     pub(crate) unsafe fn create_string_for_key(
         &mut self,
         code: u32,
@@ -161,7 +162,7 @@ impl KeyboardState for Keyboard {
     }
 }
 
-#[allow(clippy::identity_op)]
+#[allow(dead_code, clippy::identity_op)]
 pub unsafe fn flags_to_state(flags: u64) -> ModifierState {
     let has_alt = flags & NSEventModifierFlagOption;
     let has_caps_lock = flags & NSEventModifierFlagCapsLock;

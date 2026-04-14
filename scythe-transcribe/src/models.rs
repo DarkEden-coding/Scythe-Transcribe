@@ -52,6 +52,7 @@ impl ChatProvider {
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(default)]
 pub struct AppPreferences {
+    pub audio_input_device: String,
     pub transcription_provider: String,
     pub transcription_model_groq: String,
     pub transcription_model_openrouter: String,
@@ -70,6 +71,7 @@ pub struct AppPreferences {
 impl Default for AppPreferences {
     fn default() -> Self {
         Self {
+            audio_input_device: "__builtin_microphone__".to_string(),
             transcription_provider: TranscriptionProvider::Groq.as_str().to_string(),
             transcription_model_groq: "whisper-large-v3-turbo".to_string(),
             transcription_model_openrouter: String::new(),

@@ -22,7 +22,8 @@ unsafe extern "C" fn raw_callback(
     let opt = KEYBOARD_STATE.lock();
     if let Ok(mut keyboard) = opt {
         if let Some(event) = convert(_type, &cg_event, &mut keyboard) {
-            if let Some(callback) = &mut GLOBAL_CALLBACK {
+            let callback = &raw mut GLOBAL_CALLBACK;
+            if let Some(callback) = callback.as_mut().and_then(Option::as_mut) {
                 callback(event);
             }
         }
@@ -32,7 +33,11 @@ unsafe extern "C" fn raw_callback(
     cg_event
 }
 
-pub fn listen<T>(callback: T) -> Result<(), ListenError>
+fn listen_with_options<T>(
+    callback: T,
+    tap_location: CGEventTapLocation,
+    event_mask: CGEventMask,
+) -> Result<(), ListenError>
 where
     T: FnMut(Event) + 'static,
 {
@@ -40,10 +45,10 @@ where
         GLOBAL_CALLBACK = Some(Box::new(callback));
         let _pool = NSAutoreleasePool::new(nil);
         let tap = CGEventTapCreate(
-            CGEventTapLocation::HID, // HID, Session, AnnotatedSession,
+            tap_location,
             kCGHeadInsertEventTap,
             CGEventTapOption::ListenOnly,
-            kCGEventMaskForAllEvents,
+            event_mask,
             raw_callback,
             nil,
         );
@@ -62,4 +67,26 @@ where
         CFRunLoopRun();
     }
     Ok(())
+}
+
+pub fn listen<T>(callback: T) -> Result<(), ListenError>
+where
+    T: FnMut(Event) + 'static,
+{
+    listen_with_options(
+        callback,
+        CGEventTapLocation::HID,
+        kCGEventMaskForAllEvents,
+    )
+}
+
+pub fn listen_keyboard<T>(callback: T) -> Result<(), ListenError>
+where
+    T: FnMut(Event) + 'static,
+{
+    listen_with_options(
+        callback,
+        CGEventTapLocation::Session,
+        kCGEventMaskForKeyboardEvents,
+    )
 }

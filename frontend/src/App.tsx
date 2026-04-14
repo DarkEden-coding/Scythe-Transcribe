@@ -66,6 +66,7 @@ const GROQ_POST_REASONING_EFFORTS = ["", "none", "default", "low", "medium", "hi
 const OR_POST_REASONING_EFFORTS = ["", "xhigh", "high", "medium", "low", "minimal", "none"] as const;
 
 type AppPreferences = {
+  audio_input_device: string;
   transcription_provider: string;
   transcription_model_groq: string;
   transcription_model_openrouter: string;
@@ -84,6 +85,19 @@ type AppPreferences = {
 type KeysPublic = {
   groq_configured: boolean;
   openrouter_configured: boolean;
+};
+
+type AudioInputDevice = {
+  id: string;
+  name: string;
+  is_default: boolean;
+  is_builtin_candidate: boolean;
+};
+
+type AudioInputDevicesResponse = {
+  builtin_id: string;
+  system_default_id: string;
+  devices: AudioInputDevice[];
 };
 
 type AccessibilityIdentity = {
@@ -196,6 +210,7 @@ function historyTimingHotkeyLine(e: TranscriptionHistoryEntry): string | null {
 }
 
 const defaultPrefs = (): AppPreferences => ({
+  audio_input_device: "__builtin_microphone__",
   transcription_provider: "groq",
   transcription_model_groq: "whisper-large-v3-turbo",
   transcription_model_openrouter: "",
@@ -399,6 +414,11 @@ export function App() {
   const [orKeyInput, setOrKeyInput] = useState("");
   const [orModels, setOrModels] = useState<OrModel[]>([]);
   const [groqChatModels, setGroqChatModels] = useState<string[]>([]);
+  const [audioInputDevices, setAudioInputDevices] = useState<AudioInputDevice[]>([]);
+  const [audioInputIds, setAudioInputIds] = useState({
+    builtin: "__builtin_microphone__",
+    systemDefault: "__system_default__",
+  });
   const [transcriptionHistory, setTranscriptionHistory] = useState<
     TranscriptionHistoryEntry[]
   >([]);
@@ -468,6 +488,15 @@ export function App() {
     }
   }, []);
 
+  const refreshAudioInputDevices = useCallback(async () => {
+    const res = await apiJson<AudioInputDevicesResponse>("/api/audio-input-devices");
+    setAudioInputDevices(res.devices ?? []);
+    setAudioInputIds({
+      builtin: res.builtin_id || "__builtin_microphone__",
+      systemDefault: res.system_default_id || "__system_default__",
+    });
+  }, []);
+
   const commitKeywordRows = useCallback(
     (nextOrFn: KeywordRow[] | ((prev: KeywordRow[]) => KeywordRow[])) => {
       setKeywordRows((prev) => (typeof nextOrFn === "function" ? nextOrFn(prev) : nextOrFn));
@@ -531,12 +560,18 @@ export function App() {
   useEffect(() => {
     void (async () => {
       try {
-        const [p, k] = await Promise.all([
+        const [p, k, audioInputs] = await Promise.all([
           apiJson<Record<string, unknown>>("/api/preferences"),
           apiJson<KeysPublic>("/api/keys"),
+          apiJson<AudioInputDevicesResponse>("/api/audio-input-devices"),
         ]);
         const merged = { ...defaultPrefs(), ...p } as AppPreferences;
         setPrefs(merged);
+        setAudioInputDevices(audioInputs.devices ?? []);
+        setAudioInputIds({
+          builtin: audioInputs.builtin_id || "__builtin_microphone__",
+          systemDefault: audioInputs.system_default_id || "__system_default__",
+        });
         setKeywordRows(parseKeywordPairs(merged.keyword_replacement_spec));
         setKeys(k);
         try {
@@ -691,7 +726,7 @@ export function App() {
     if (busy) return;
     if (!recording) {
       try {
-        const session = await startMicRecording();
+        const session = await startMicRecording(prefsRef.current.audio_input_device);
         micRef.current = session;
         setRecording(true);
         setStatus("Recording…");
@@ -781,6 +816,12 @@ export function App() {
   const hotkeyDiagnostics = runtimeState?.hotkey;
   const hotkeyConflict = hotkeyConflictWarning(prefs.hotkey_toggle_recording);
   const osIconStatus = runtimeState?.os_icon;
+  const audioInputSelection = prefs.audio_input_device || audioInputIds.builtin;
+  const selectedAudioInputKnown =
+    audioInputSelection === audioInputIds.builtin ||
+    audioInputSelection === audioInputIds.systemDefault ||
+    audioInputDevices.some((d) => d.id === audioInputSelection);
+  const hasBuiltInAudioInput = audioInputDevices.some((d) => d.is_builtin_candidate);
   const accessibilityGrantTarget =
     accessibilityIdentity?.app_bundle ?? accessibilityIdentity?.executable ?? "";
   const needsPrivacyPermission =
@@ -848,7 +889,58 @@ export function App() {
             role="tabpanel"
             aria-labelledby="tab-general"
           >
-            <h2 className="section-title">Keyboard shortcuts</h2>
+            <h2 className="section-title">Microphone</h2>
+            <p className="muted">
+              Choose the input used by the global hotkey recorder. Built-in microphone avoids
+              Bluetooth headset mode when macOS can find it.
+            </p>
+            <div className="field-row field-row--shortcut">
+              <label className="flex-240">
+                Audio input
+                <select
+                  className="input-field"
+                  value={audioInputSelection}
+                  onChange={(e) => setPref("audio_input_device", e.target.value)}
+                >
+                  <option value={audioInputIds.builtin}>Built-in microphone</option>
+                  <option value={audioInputIds.systemDefault}>System default</option>
+                  {audioInputDevices.map((device) => (
+                    <option key={device.id} value={device.id}>
+                      {device.name}
+                      {device.is_default ? " (system default)" : ""}
+                    </option>
+                  ))}
+                </select>
+              </label>
+              <button
+                type="button"
+                className="btn-outline"
+                onClick={() => {
+                  void (async () => {
+                    try {
+                      await refreshAudioInputDevices();
+                    } catch (e) {
+                      setStatus(e instanceof Error ? e.message : String(e));
+                      setStatusColor("#c62828");
+                    }
+                  })();
+                }}
+              >
+                Refresh inputs
+              </button>
+            </div>
+            {!selectedAudioInputKnown && (
+              <p className="muted" style={{ color: "#ffb300", marginTop: "var(--space-2)" }}>
+                Selected input is not currently available. Recording will use the system default.
+              </p>
+            )}
+            {audioInputSelection === audioInputIds.builtin && !hasBuiltInAudioInput && (
+              <p className="muted" style={{ color: "#ffb300", marginTop: "var(--space-2)" }}>
+                Built-in microphone was not found. Recording will use the system default.
+              </p>
+            )}
+
+            <h2 className="section-title section-title--spaced">Keyboard shortcuts</h2>
             <p className="muted">
               The desktop process captures this shortcut globally (hold to record, release to
               transcribe, post-process if enabled, then paste at the text cursor). Keep the settings

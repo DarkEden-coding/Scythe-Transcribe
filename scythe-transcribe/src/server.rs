@@ -90,6 +90,7 @@ pub fn build_router_with_state(state: AppState) -> Router {
             "/api/preferences",
             get(get_preferences).put(put_preferences),
         )
+        .route("/api/audio-input-devices", get(audio_input_devices))
         .route("/api/keys", get(get_keys).put(put_keys))
         .route("/api/groq/chat-models", get(groq_chat_models))
         .route("/api/openrouter/models", get(openrouter_models_cached))
@@ -176,6 +177,14 @@ async fn get_preferences() -> Json<AppPreferences> {
 async fn put_preferences(Json(body): Json<AppPreferences>) -> Json<AppPreferences> {
     let _ = save_preferences(&body);
     Json(load_preferences())
+}
+
+async fn audio_input_devices() -> Json<Value> {
+    Json(json!({
+        "builtin_id": hotkey::AUDIO_INPUT_BUILT_IN,
+        "system_default_id": hotkey::AUDIO_INPUT_SYSTEM_DEFAULT,
+        "devices": hotkey::audio_input_devices(),
+    }))
 }
 
 async fn get_keys() -> Json<Value> {

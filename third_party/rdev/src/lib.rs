@@ -228,7 +228,10 @@ mod macos;
 #[cfg(target_os = "macos")]
 pub use crate::macos::Keyboard;
 #[cfg(target_os = "macos")]
-use crate::macos::{display_size as _display_size, listen as _listen, simulate as _simulate};
+use crate::macos::{
+    display_size as _display_size, listen as _listen, listen_keyboard as _listen_keyboard,
+    simulate as _simulate,
+};
 
 #[cfg(target_os = "linux")]
 mod linux;
@@ -270,6 +273,15 @@ where
     T: FnMut(Event) + 'static,
 {
     _listen(callback)
+}
+
+/// Listening to macOS keyboard events only, using a session-level listen-only tap.
+#[cfg(target_os = "macos")]
+pub fn listen_keyboard<T>(callback: T) -> Result<(), ListenError>
+where
+    T: FnMut(Event) + 'static,
+{
+    _listen_keyboard(callback)
 }
 
 /// Sending some events
