@@ -1,0 +1,23 @@
+{
+  "state": "stopped",
+  "error": null,
+  "capture_state": "idle",
+  "capture_state_changed_at": null,
+  "configured_combo": "",
+  "combo_parts": [],
+  "pressed_tokens": [],
+  "combo_active": false,
+  "last_event": null,
+  "last_token": null,
+  "last_key": null,
+  "last_event_at": null,
+  "last_combo_matched_at": null,
+  "last_recording_started_at": null,
+  "last_recording_stopped_at": null,
+  "last_stream_error": null,
+  "last_stream_error_at": null,
+  "last_transcribe_error": null,
+  "last_transcribe_error_at": null,
+  "event_count": 0,
+  "listener_backend": "rdev"
+}

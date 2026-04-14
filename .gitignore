@@ -1,0 +1,41 @@
+# Rust / Cargo
+/target/
+
+# Dependencies & build output (frontend)
+node_modules/
+dist/
+pack/
+
+# Vite
+.vite/
+
+# Environment and local secrets
+.env
+.env.*
+!.env.example
+
+# IDE / editors
+.idea/
+.vscode/
+.zed/
+*.swp
+*.swo
+*~
+
+# Tooling artifacts
+*.rs.bk
+*.orig
+
+# OS
+.DS_Store
+Thumbs.db
+
+# Logs and diagnostics
+*.log
+
+# Coverage (llvm-cov, tarpaulin, lcov, etc.)
+*.profraw
+default.profraw
+lcov.info
+coverage/
+htmlcov/

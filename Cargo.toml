@@ -1,0 +1,11 @@
+[workspace]
+resolver = "2"
+members = ["scythe-transcribe", "xtask"]
+
+[patch.crates-io]
+rdev = { path = "third_party/rdev" }
+
+[workspace.package]
+version = "0.2.0"
+edition = "2021"
+license = "MIT OR Apache-2.0"
