@@ -2,6 +2,7 @@
 
 use std::collections::HashMap;
 use std::io::Cursor;
+use std::sync::Arc;
 use std::time::{SystemTime, UNIX_EPOCH};
 
 use axum::http::StatusCode;
@@ -9,9 +10,12 @@ use futures::stream::FuturesUnordered;
 use futures::StreamExt;
 use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
+use tokio::sync::Semaphore;
 
 use crate::config::{
-    MAX_UPLOAD_BYTES, POSTPROCESS_CHUNK_MAX_USER_CHARS, POSTPROCESS_MAX_PARALLEL_CHUNKS,
+    GROQ_ASR_CHUNK_BOUNDARY_SEARCH_SEC, GROQ_ASR_CHUNK_DURATION_SEC, GROQ_ASR_MAX_PARALLEL_CHUNKS,
+    GROQ_ASR_MIN_CHUNK_SEC, MAX_UPLOAD_BYTES, POSTPROCESS_CHUNK_MAX_USER_CHARS,
+    POSTPROCESS_MAX_PARALLEL_CHUNKS,
 };
 use crate::groq;
 use crate::models::{AppPreferences, ChatProvider, TranscriptionProvider};
@@ -158,19 +162,31 @@ pub async fn postprocess_transcript_text(
         * 1000.0;
 
     let n = chunks.len();
-    let _ = POSTPROCESS_MAX_PARALLEL_CHUNKS.min(n);
+    let max_p = POSTPROCESS_MAX_PARALLEL_CHUNKS.max(1).min(n.max(1));
+    let sem = Arc::new(Semaphore::new(max_p));
     let mut results: Vec<Option<String>> = vec![None; n];
     let t_api_start = std::time::Instant::now();
     let mut futs: FuturesUnordered<_> = FuturesUnordered::new();
     for (idx, ch) in chunks.iter().enumerate() {
-        let sys_seg = format!("{base_sys}{}", segment_instruction(idx, n));
+        let sys_seg = if n == 1 {
+            base_sys.to_string()
+        } else {
+            format!("{base_sys}{}", segment_instruction(idx, n))
+        };
         let ch = ch.clone();
         let client = client.clone();
         let model = model.to_string();
         let pprov = pprov.to_string();
         let ge = groq_reasoning_effort.map(str::to_string);
         let oe = openrouter_reasoning_effort.map(str::to_string);
+        let sem = sem.clone();
         futs.push(async move {
+            let _permit = sem.acquire_owned().await.map_err(|_| {
+                (
+                    StatusCode::INTERNAL_SERVER_ERROR,
+                    "semaphore closed".to_string(),
+                )
+            })?;
             let out = run_post_segment(
                 &client,
                 &pprov,
@@ -243,6 +259,111 @@ fn wav_duration_seconds(raw: &[u8]) -> Option<f64> {
     Some(reader.duration() as f64 / sample_rate as f64)
 }
 
+fn merge_groq_chunk_transcriptions(
+    chunks: &[groq::GroqTranscriptionResult],
+) -> groq::GroqTranscriptionResult {
+    let mut text_parts: Vec<String> = Vec::new();
+    let mut segment_count = 0usize;
+    let mut silent_segment_count = 0usize;
+    let mut max_no_speech: Option<f64> = None;
+    let mut min_avg_logprob: Option<f64> = None;
+    let mut max_compression: Option<f64> = None;
+    let mut duration_sum = 0.0f64;
+    let mut language: Option<String> = None;
+
+    for c in chunks {
+        let t = c.text.trim();
+        if !t.is_empty() {
+            text_parts.push(t.to_string());
+        }
+        if language.is_none() {
+            if let Some(l) = c.metadata.get("language").and_then(|v| v.as_str()) {
+                if !l.is_empty() {
+                    language = Some(l.to_string());
+                }
+            }
+        }
+        segment_count += c
+            .metadata
+            .get("segment_count")
+            .and_then(|v| v.as_u64())
+            .unwrap_or(0) as usize;
+        silent_segment_count += c
+            .metadata
+            .get("silent_segment_count")
+            .and_then(|v| v.as_u64())
+            .unwrap_or(0) as usize;
+        if let Some(v) = c
+            .metadata
+            .get("max_no_speech_prob")
+            .and_then(|x| x.as_f64())
+        {
+            max_no_speech = Some(max_no_speech.map_or(v, |m| m.max(v)));
+        }
+        if let Some(v) = c.metadata.get("min_avg_logprob").and_then(|x| x.as_f64()) {
+            min_avg_logprob = Some(min_avg_logprob.map_or(v, |m| m.min(v)));
+        }
+        if let Some(v) = c
+            .metadata
+            .get("max_compression_ratio")
+            .and_then(|x| x.as_f64())
+        {
+            max_compression = Some(max_compression.map_or(v, |m| m.max(v)));
+        }
+        if let Some(v) = c.metadata.get("duration").and_then(|x| x.as_f64()) {
+            duration_sum += v;
+        }
+    }
+
+    let text = text_parts.join(" ");
+    let silence_detected = text.trim().is_empty();
+
+    let mut metadata: HashMap<String, Value> = HashMap::new();
+    metadata.insert("provider".to_string(), Value::String("groq".to_string()));
+    metadata.insert(
+        "response_format".to_string(),
+        Value::String("verbose_json".to_string()),
+    );
+    metadata.insert("is_silence".to_string(), Value::Bool(silence_detected));
+    if let Some(l) = language {
+        metadata.insert("language".to_string(), Value::String(l));
+    }
+    if duration_sum > 0.0 {
+        metadata.insert("duration".to_string(), json!(duration_sum));
+    }
+    metadata.insert(
+        "segment_count".to_string(),
+        Value::Number(segment_count.into()),
+    );
+    metadata.insert(
+        "silent_segment_count".to_string(),
+        Value::Number(silent_segment_count.into()),
+    );
+    if let Some(v) = max_no_speech {
+        metadata.insert("max_no_speech_prob".to_string(), json!(v));
+    }
+    if let Some(v) = min_avg_logprob {
+        metadata.insert("min_avg_logprob".to_string(), json!(v));
+    }
+    if let Some(v) = max_compression {
+        metadata.insert("max_compression_ratio".to_string(), json!(v));
+    }
+    metadata.insert(
+        "asr_parallel_chunks".to_string(),
+        Value::Number(chunks.len().into()),
+    );
+    metadata.insert("asr_speech_aware_splits".to_string(), Value::Bool(true));
+    if silence_detected {
+        metadata.insert("raw_text".to_string(), Value::String(text.clone()));
+    }
+
+    groq::GroqTranscriptionResult {
+        text,
+        silence_detected,
+        metadata,
+    }
+}
+
 #[derive(Clone, Serialize)]
 pub struct TranscribeResponse {
     pub transcript: String,
@@ -293,16 +414,82 @@ async fn transcribe_asr_groq(
         model
     };
     let whisper_ctx = groq_asr_prompt_from_replacement_spec(&job.keyword_replacement_spec, 1000);
-    let groq_result = groq::transcribe_audio(
-        client,
-        &key,
-        raw,
-        model,
-        "recording.wav",
-        whisper_ctx.as_deref(),
-    )
-    .await
-    .map_err(|e| (StatusCode::BAD_GATEWAY, e.to_string()))?;
+
+    let chunks: Vec<Vec<u8>> = if GROQ_ASR_CHUNK_DURATION_SEC > 0.0 {
+        crate::wav_speech_chunks::split_wav_for_parallel_groq(
+            raw,
+            GROQ_ASR_CHUNK_DURATION_SEC,
+            GROQ_ASR_CHUNK_BOUNDARY_SEARCH_SEC,
+            GROQ_ASR_MIN_CHUNK_SEC,
+        )
+        .unwrap_or_else(|_| vec![raw.to_vec()])
+    } else {
+        vec![raw.to_vec()]
+    };
+
+    let groq_result = if chunks.len() <= 1 {
+        groq::transcribe_audio(
+            client,
+            &key,
+            raw,
+            model,
+            "recording.wav",
+            whisper_ctx.as_deref(),
+        )
+        .await
+        .map_err(|e| (StatusCode::BAD_GATEWAY, e.to_string()))?
+    } else {
+        let n = chunks.len();
+        let max_p = GROQ_ASR_MAX_PARALLEL_CHUNKS.max(1).min(n);
+        let sem = Arc::new(Semaphore::new(max_p));
+        let asr_model = model.to_string();
+        let mut futs: FuturesUnordered<_> = FuturesUnordered::new();
+        for (idx, wav) in chunks.into_iter().enumerate() {
+            let client = client.clone();
+            let key = key.clone();
+            let asr_model = asr_model.clone();
+            let wc = whisper_ctx.clone();
+            let sem = sem.clone();
+            futs.push(async move {
+                let _permit = sem.acquire_owned().await.map_err(|_| {
+                    (
+                        StatusCode::INTERNAL_SERVER_ERROR,
+                        "semaphore closed".to_string(),
+                    )
+                })?;
+                let r = groq::transcribe_audio(
+                    &client,
+                    &key,
+                    &wav,
+                    asr_model.as_str(),
+                    &format!("chunk_{idx:03}.wav"),
+                    wc.as_deref(),
+                )
+                .await
+                .map_err(|e| (StatusCode::BAD_GATEWAY, e.to_string()))?;
+                Ok::<_, (StatusCode, String)>((idx, r))
+            });
+        }
+        let mut slots: Vec<Option<groq::GroqTranscriptionResult>> = vec![None; n];
+        while let Some(item) = futs.next().await {
+            let (idx, r) = item?;
+            slots[idx] = Some(r);
+        }
+        let ordered: Vec<groq::GroqTranscriptionResult> = slots
+            .into_iter()
+            .enumerate()
+            .map(|(i, s)| {
+                s.ok_or_else(|| {
+                    (
+                        StatusCode::INTERNAL_SERVER_ERROR,
+                        format!("missing ASR chunk result {i}"),
+                    )
+                })
+            })
+            .collect::<Result<Vec<_>, _>>()?;
+        merge_groq_chunk_transcriptions(&ordered)
+    };
+
     let mut meta: HashMap<String, Value> = HashMap::new();
     for (k, v) in &groq_result.metadata {
         meta.insert(k.clone(), v.clone());

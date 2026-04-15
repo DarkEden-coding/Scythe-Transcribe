@@ -18,7 +18,9 @@ Requirements: pip install -r requirements.txt
 
 import argparse
 import json
+import os
 import re
+import subprocess
 import sys
 import time
 from datetime import datetime
@@ -35,8 +37,9 @@ except ImportError as _err:
     print("Run:  pip install -r requirements.txt")
     sys.exit(1)
 
-SCRIPT_DIR = Path(__file__).parent
-SAMPLES_DIR = SCRIPT_DIR / "samples" / "recordings"
+SCRIPT_DIR   = Path(__file__).parent
+PROJECT_ROOT = SCRIPT_DIR.parent
+SAMPLES_DIR  = SCRIPT_DIR / "samples" / "recordings"
 MANIFEST_FILE = SAMPLES_DIR / "manifest.json"
 RESULTS_DIR = SCRIPT_DIR / "results"
 
@@ -305,11 +308,69 @@ def run_benchmark(server: str, *, postprocess: bool) -> dict:
     }
 
 
-# ── terminal table ────────────────────────────────────────────────────────────
+# ── terminal table & JSON summary ─────────────────────────────────────────────
+
+def compute_benchmark_summary(data: dict) -> dict:
+    """Build aggregate stats and error list for terminal output and JSON export.
+
+    Mirrors the averages printed after the Rich table (WER, latency, speed).
+
+    Args:
+        data: Full benchmark payload including ``results`` and ``meta_used``.
+
+    Returns:
+        Dict with ``successful_count``, ``error_count``, optional ``aggregate``,
+        and ``errors`` (list of ``sample_id`` / ``error`` for failed rows).
+    """
+    results = data.get("results", [])
+    ok = [r for r in results if "error" not in r]
+    errors = [r for r in results if "error" in r]
+    meta = data.get("meta_used", {})
+    pp_on = meta.get("postprocess_enabled", False)
+
+    summary: dict = {
+        "successful_count": len(ok),
+        "error_count": len(errors),
+        "postprocess_enabled": pp_on,
+        "aggregate": None,
+        "errors": [{"sample_id": e["sample_id"], "error": e["error"]} for e in errors],
+    }
+
+    if not ok:
+        return summary
+
+    wers = [r["wer"]["wer"] for r in ok]
+    asr_mss = [r["asr_ms"] for r in ok]
+    total_mss = [r["total_ms"] for r in ok]
+    speeds = [r["speed_factor"] for r in ok if r.get("speed_factor") is not None]
+    sorted_wers = sorted(wers)
+    median_wer = sorted_wers[len(sorted_wers) // 2]
+
+    agg: dict = {
+        "average_wer": round(sum(wers) / len(wers), 6),
+        "median_wer": round(median_wer, 6),
+        "average_asr_ms": round(sum(asr_mss) / len(asr_mss), 1),
+        "average_total_ms": round(sum(total_mss) / len(total_mss), 1),
+        "average_speed_factor": round(sum(speeds) / len(speeds), 2) if speeds else None,
+    }
+    if pp_on:
+        pp_times = [r["postprocess_ms"] for r in ok if r.get("postprocess_ms") is not None]
+        agg["average_postprocess_ms"] = (
+            round(sum(pp_times) / len(pp_times), 1) if pp_times else None
+        )
+    else:
+        agg["average_postprocess_ms"] = None
+
+    summary["aggregate"] = agg
+    return summary
+
 
 def print_summary_table(data: dict) -> None:
     ok     = [r for r in data["results"] if "error" not in r]
     errors = [r for r in data["results"] if "error" in r]
+
+    summary = compute_benchmark_summary(data)
+    data["summary"] = summary
 
     if not ok:
         console.print("[red]No successful results to display.[/red]")
@@ -321,6 +382,8 @@ def print_summary_table(data: dict) -> None:
 
     meta   = data.get("meta_used", {})
     pp_on  = meta.get("postprocess_enabled", False)
+    agg    = summary["aggregate"]
+    assert agg is not None
 
     table = Table(
         title="\nBenchmark Results",
@@ -339,8 +402,6 @@ def print_summary_table(data: dict) -> None:
         table.add_column("PP\n(ms)", justify="right", width=8)
     table.add_column("Total\n(ms)", justify="right", width=9)
     table.add_column("Speed",       justify="right", width=7)
-
-    wers, asr_mss, total_mss, speeds = [], [], [], []
 
     for r in ok:
         wer   = r["wer"]
@@ -366,32 +427,22 @@ def print_summary_table(data: dict) -> None:
         row += [f"{r['total_ms']:.0f}", speed]
         table.add_row(*row)
 
-        wers.append(wer["wer"])
-        asr_mss.append(r["asr_ms"])
-        total_mss.append(r["total_ms"])
-        if r.get("speed_factor"):
-            speeds.append(r["speed_factor"])
-
     console.print(table)
 
-    # Aggregate stats.
-    avg_wer   = sum(wers)     / len(wers)
-    avg_asr   = sum(asr_mss)  / len(asr_mss)
-    avg_total = sum(total_mss) / len(total_mss)
-    avg_speed = sum(speeds)    / len(speeds) if speeds else None
-
+    avg_wer = agg["average_wer"]
     wer_style = "green" if avg_wer < 0.05 else ("yellow" if avg_wer < 0.15 else "red")
 
     console.print("[bold]Aggregate[/bold]")
     console.print(f"  Samples run:      {len(ok)}  ({len(errors)} error(s))")
     console.print(f"  Avg WER:          [{wer_style}]{avg_wer * 100:.2f}%[/{wer_style}]")
-    console.print(f"  Median WER:       {sorted(wers)[len(wers)//2] * 100:.2f}%")
-    console.print(f"  Avg ASR latency:  {avg_asr:.0f} ms")
+    console.print(f"  Median WER:       {agg['median_wer'] * 100:.2f}%")
+    console.print(f"  Avg ASR latency:  {agg['average_asr_ms']:.0f} ms")
     if pp_on:
-        pp_times = [r["postprocess_ms"] for r in ok if r.get("postprocess_ms") is not None]
-        if pp_times:
-            console.print(f"  Avg PP latency:   {sum(pp_times)/len(pp_times):.0f} ms")
-    console.print(f"  Avg total:        {avg_total:.0f} ms")
+        pp_avg = agg.get("average_postprocess_ms")
+        if pp_avg is not None:
+            console.print(f"  Avg PP latency:   {pp_avg:.0f} ms")
+    console.print(f"  Avg total:        {agg['average_total_ms']:.0f} ms")
+    avg_speed = agg.get("average_speed_factor")
     if avg_speed:
         console.print(f"  Avg speed factor: {avg_speed:.1f}x real-time")
 
@@ -417,6 +468,76 @@ def print_summary_table(data: dict) -> None:
             console.print(f"  {e['sample_id']}: {e['error']}")
 
 
+# ── build & server management ────────────────────────────────────────────────
+
+def build_backend() -> None:
+    """Rebuild the release binary via cargo."""
+    console.print("\n[bold]Building scythe-transcribe (release)...[/bold]")
+    result = subprocess.run(
+        ["cargo", "build", "--release", "-p", "scythe-transcribe"],
+        cwd=PROJECT_ROOT,
+    )
+    if result.returncode != 0:
+        console.print("[red]Build failed. Fix the errors above and try again.[/red]")
+        sys.exit(result.returncode)
+    console.print("[green]Build succeeded.[/green]")
+
+
+def find_binary() -> Path:
+    """Return the path to the compiled release binary, exiting if absent."""
+    name   = "scythe-transcribe.exe" if sys.platform == "win32" else "scythe-transcribe"
+    binary = PROJECT_ROOT / "target" / "release" / name
+    if not binary.exists():
+        console.print(f"[red]Binary not found: {binary}[/red]")
+        sys.exit(1)
+    return binary
+
+
+def start_server(binary: Path) -> subprocess.Popen:
+    """
+    Launch the binary in tray-less server-only mode.
+    Returns the Popen handle so the caller can stop it later.
+    """
+    env = os.environ.copy()
+    env["SCYTHE_SERVER_ONLY"] = "1"
+    env["SCYTHE_TRAY"]        = "0"
+    console.print(f"\n  Starting server ({binary.name})...", end=" ")
+    return subprocess.Popen(
+        [str(binary)],
+        env=env,
+        stdout=subprocess.DEVNULL,
+        stderr=subprocess.DEVNULL,
+    )
+
+
+def wait_for_server(url: str, timeout: float = 30.0) -> None:
+    """Poll /api/health until the server is up or the timeout expires."""
+    deadline = time.monotonic() + timeout
+    while time.monotonic() < deadline:
+        try:
+            if requests.get(f"{url}/api/health", timeout=2).ok:
+                console.print("ready.")
+                return
+        except Exception:
+            pass
+        time.sleep(0.5)
+    console.print("[red]timed out.[/red]")
+    console.print(f"[yellow]Warning: server did not become ready within {timeout:.0f}s.[/yellow]")
+    sys.exit(1)
+
+
+def stop_server(proc: subprocess.Popen) -> None:
+    """Terminate the server process, forcefully if needed."""
+    console.print("\n  Stopping server...", end=" ")
+    proc.terminate()
+    try:
+        proc.wait(timeout=5)
+    except subprocess.TimeoutExpired:
+        proc.kill()
+        proc.wait()
+    console.print("stopped.")
+
+
 # ── results persistence ───────────────────────────────────────────────────────
 
 def save_results(data: dict) -> Path:
@@ -426,6 +547,31 @@ def save_results(data: dict) -> Path:
     with open(out_path, "w", encoding="utf-8") as f:
         json.dump(data, f, indent=2, ensure_ascii=False)
     return out_path
+
+
+def backfill_benchmark_result_summaries(results_dir: Path | None = None) -> list[Path]:
+    """Add or refresh ``summary`` on each ``benchmark_*.json`` under ``results_dir``.
+
+    Uses the same aggregates as new benchmark runs. Safe to run on files that
+    already include ``summary`` (values are recomputed from ``results``).
+
+    Args:
+        results_dir: Directory containing result files; defaults to :data:`RESULTS_DIR`.
+
+    Returns:
+        Paths of JSON files that were written.
+    """
+    root = results_dir or RESULTS_DIR
+    root.mkdir(parents=True, exist_ok=True)
+    updated: list[Path] = []
+    for path in sorted(root.glob("benchmark_*.json")):
+        with open(path, encoding="utf-8") as f:
+            data = json.load(f)
+        data["summary"] = compute_benchmark_summary(data)
+        with open(path, "w", encoding="utf-8") as f:
+            json.dump(data, f, indent=2, ensure_ascii=False)
+        updated.append(path)
+    return updated
 
 
 # ── main ──────────────────────────────────────────────────────────────────────
@@ -444,12 +590,31 @@ def main() -> None:
         "--no-postprocess", action="store_true",
         help="Disable post-processing even if enabled in preferences",
     )
+    parser.add_argument(
+        "--auto", action="store_true",
+        help=(
+            "Rebuild the backend, start a temporary server, run the benchmark, "
+            "then stop the server automatically"
+        ),
+    )
     args = parser.parse_args()
 
-    data     = run_benchmark(args.server, postprocess=not args.no_postprocess)
-    print_summary_table(data)
-    out_path = save_results(data)
-    console.print(f"\n[dim]Results saved → {out_path}[/dim]\n")
+    if args.auto:
+        build_backend()
+        proc = start_server(find_binary())
+        try:
+            wait_for_server(args.server)
+            data = run_benchmark(args.server, postprocess=not args.no_postprocess)
+            print_summary_table(data)
+            out_path = save_results(data)
+            console.print(f"\n[dim]Results saved -> {out_path}[/dim]\n")
+        finally:
+            stop_server(proc)
+    else:
+        data     = run_benchmark(args.server, postprocess=not args.no_postprocess)
+        print_summary_table(data)
+        out_path = save_results(data)
+        console.print(f"\n[dim]Results saved -> {out_path}[/dim]\n")
 
 
 if __name__ == "__main__":

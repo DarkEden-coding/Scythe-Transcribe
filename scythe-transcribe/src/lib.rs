@@ -16,5 +16,6 @@ pub mod server;
 pub mod settings_store;
 pub mod startup;
 pub mod text_replacements;
+pub mod wav_speech_chunks;
 
 pub use server::build_router;

@@ -28,31 +28,30 @@ cd benchmark
 pip install -r requirements.txt
 ```
 
-The benchmark talks to the app over HTTP — **Scythe-Transcribe must be running**
-before you run `run_benchmark.py`. Starting the app from the system tray or
-running the binary directly is sufficient; you do not need to be actively using it.
+The benchmark communicates with Scythe-Transcribe over HTTP. **The app must be
+running before you call `run_benchmark.py`**, unless you use the `--auto` flag
+which handles building and running the server for you (see Step 2).
 
 ---
 
 ## Important: code changes require a rebuild
 
-The benchmark runs against the **compiled, running app** — not the source code.
-If you make any changes to the Rust backend or the frontend and want those
-changes to be reflected in benchmark results, you must:
+The benchmark runs against the **compiled, running binary** — not the source
+code. If you change anything in the Rust backend and want those changes
+reflected in benchmark results, the new binary must be built and running before
+you measure.
 
-1. Rebuild the app:
-   ```
-   cargo build --release -p scythe-transcribe
-   ```
-   Or for a full distribution build including the frontend:
-   ```
-   cargo xtask dist
-   ```
+If you are iterating on the backend, **use `--auto`** (see Step 2) — it rebuilds
+and restarts the server automatically on every run so you never accidentally
+benchmark a stale binary.
 
-2. Restart the app so the new binary is running.
+If you prefer to manage the server yourself, rebuild manually first:
 
-Running the benchmark against a stale binary will measure the old behaviour,
-not your changes.
+```
+cargo build --release -p scythe-transcribe
+```
+
+Then restart the app before running the benchmark.
 
 ---
 
@@ -94,25 +93,46 @@ Progress is saved after every paragraph, so you can stop and resume at any time.
 
 ## Step 2 — run the benchmark
 
-Make sure **Scythe-Transcribe is running**, then:
+### Recommended: use `--auto`
 
 ```
-python run_benchmark.py
+python run_benchmark.py --auto
 ```
 
-The script reads your current app configuration directly from the running
-server (`GET /api/preferences`), so whatever provider, model, and
-post-processing settings you have active at that moment are what gets benchmarked.
+`--auto` takes care of everything in one command:
 
-Each WAV is posted to `POST /api/transcribe` exactly as the frontend would send
-it. If post-processing is enabled in your preferences, it runs as part of the
-benchmark and WER is evaluated against the post-processed output.
+1. Rebuilds the backend (`cargo build --release -p scythe-transcribe`).
+2. Starts a temporary server instance in the background (no tray, no frontend).
+3. Waits for it to become ready.
+4. Runs the full benchmark.
+5. Stops the server when finished.
 
-### Useful flags
+This ensures you are always measuring the current code. It also means you do
+not need to have the app running beforehand, and it will not interfere with any
+existing instance you already have open.
+
+### Manual: start the app yourself
+
+If you want to benchmark a specific running instance (for example, the packaged
+app with its own settings):
+
+1. Make sure Scythe-Transcribe is already running.
+2. Run:
+   ```
+   python run_benchmark.py
+   ```
+
+In both cases the script reads configuration directly from the server
+(`GET /api/preferences`), so whatever provider, model, and post-processing
+settings are active at that moment are what gets benchmarked. Each WAV is
+posted to `POST /api/transcribe` exactly as the frontend would send it.
+
+### All flags
 
 | Flag | Effect |
 |------|--------|
-| `--server URL` | Use a different server address (default: `http://127.0.0.1:8765`) |
+| `--auto` | Rebuild, start a temporary server, benchmark, then stop it |
+| `--server URL` | Connect to a different server address (default: `http://127.0.0.1:8765`) |
 | `--no-postprocess` | Disable post-processing for this run even if it is enabled in preferences |
 
 ### Output

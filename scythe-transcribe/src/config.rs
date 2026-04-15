@@ -19,6 +19,19 @@ pub const POSTPROCESS_CHUNK_MAX_USER_CHARS: usize = 4500;
 /// Post-process: max parallel chunk requests.
 pub const POSTPROCESS_MAX_PARALLEL_CHUNKS: usize = 8;
 
+/// Groq ASR: split WAVs longer than this (seconds) into multiple chunks for parallel API calls.
+/// Set to `0.0` to send the whole recording in a single request (legacy behavior).
+pub const GROQ_ASR_CHUNK_DURATION_SEC: f64 = 5.0;
+
+/// When refining a nominal chunk boundary, search ±this many seconds for a low-energy pause.
+pub const GROQ_ASR_CHUNK_BOUNDARY_SEARCH_SEC: f64 = 0.85;
+
+/// Chunks shorter than this (after pause search) are avoided by boundary constraints when possible.
+pub const GROQ_ASR_MIN_CHUNK_SEC: f64 = 1.25;
+
+/// Max concurrent Groq transcription requests when using chunked ASR.
+pub const GROQ_ASR_MAX_PARALLEL_CHUNKS: usize = 6;
+
 /// Upper bound for post-process completion `max_tokens` / `max_completion_tokens`.
 #[must_use]
 pub fn postprocess_max_completion_tokens(system_prompt: &str, user_content: &str) -> u32 {
