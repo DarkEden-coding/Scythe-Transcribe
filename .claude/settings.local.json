@@ -1,0 +1,8 @@
+{
+  "permissions": {
+    "allow": [
+      "Bash(python -m py_compile \"E:\\\\Vs Code Projects\\\\Scythe-Transcribe\\\\benchmark\\\\record_samples.py\")",
+      "Bash(python -m py_compile \"E:\\\\Vs Code Projects\\\\Scythe-Transcribe\\\\benchmark\\\\run_benchmark.py\")"
+    ]
+  }
+}
