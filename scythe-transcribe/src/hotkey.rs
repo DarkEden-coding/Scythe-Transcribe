@@ -699,10 +699,19 @@ fn run_hotkey_loop() {
         if st.recording.is_none() {
             continue;
         }
-        match crate::macos::hotkey_combo_physically_pressed(&st.combo_parts) {
-            Some(true) => continue,
-            None if combo_requirements_met(&st.counts, &st.combo_parts) => continue,
-            Some(false) | None => {}
+        #[cfg(target_os = "macos")]
+        {
+            match crate::macos::hotkey_combo_physically_pressed(&st.combo_parts) {
+                Some(true) => continue,
+                None if combo_requirements_met(&st.counts, &st.combo_parts) => continue,
+                Some(false) | None => {}
+            }
+        }
+        #[cfg(not(target_os = "macos"))]
+        {
+            if combo_requirements_met(&st.counts, &st.combo_parts) {
+                continue;
+            }
         }
         let now = std::time::SystemTime::now()
             .duration_since(std::time::UNIX_EPOCH)

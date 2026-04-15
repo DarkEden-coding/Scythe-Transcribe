@@ -5,6 +5,12 @@ use std::io;
 use std::path::Path;
 use std::process::Command;
 
+#[cfg(windows)]
+const NPM: &str = "npm.cmd";
+
+#[cfg(not(windows))]
+const NPM: &str = "npm";
+
 fn main() -> anyhow::Result<()> {
     let mut args = std::env::args().skip(1);
     let task = args.next().unwrap_or_else(|| "help".to_string());
@@ -16,14 +22,14 @@ fn main() -> anyhow::Result<()> {
     match task.as_str() {
         "build-ui" => {
             let frontend = workspace_root.join("frontend");
-            let status = Command::new("npm")
+            let status = Command::new(NPM)
                 .args(["ci"])
                 .current_dir(&frontend)
                 .status()?;
             if !status.success() {
                 anyhow::bail!("npm ci failed");
             }
-            let status = Command::new("npm")
+            let status = Command::new(NPM)
                 .args(["run", "build"])
                 .current_dir(&frontend)
                 .status()?;
