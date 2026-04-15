@@ -71,6 +71,7 @@ type AppPreferences = {
   transcription_provider: string;
   transcription_model_groq: string;
   transcription_model_openrouter: string;
+  groq_asr_min_audio_chunk_sec: number;
   postprocess_enabled: boolean;
   postprocess_prompt: string;
   postprocess_provider: string;
@@ -409,6 +410,7 @@ const defaultPrefs = (): AppPreferences => ({
   transcription_provider: "groq",
   transcription_model_groq: "whisper-large-v3-turbo",
   transcription_model_openrouter: "",
+  groq_asr_min_audio_chunk_sec: 10,
   postprocess_enabled: false,
   postprocess_prompt: "Summarize the transcript in bullet points.",
   postprocess_provider: "openrouter",
@@ -974,6 +976,7 @@ export function App() {
         transcription_provider: p.transcription_provider,
         transcription_model_groq: p.transcription_model_groq,
         transcription_model_openrouter: p.transcription_model_openrouter,
+        groq_asr_min_audio_chunk_sec: p.groq_asr_min_audio_chunk_sec,
         openrouter_transcription_instruction: p.openrouter_transcription_instruction,
         keyword_replacement_spec: p.keyword_replacement_spec,
         postprocess_enabled: p.postprocess_enabled,
@@ -1666,7 +1669,31 @@ export function App() {
                       }
                     />
                   </label>
-                ) : null}
+                ) : (
+                  <label className="field-inline" style={{ marginTop: "var(--space-4)" }}>
+                    <span className="field-inline-label">Minimum audio chunk seconds</span>
+                    <input
+                      className="input-field"
+                      type="number"
+                      min={1}
+                      max={120}
+                      step={0.5}
+                      value={prefs.groq_asr_min_audio_chunk_sec}
+                      onChange={(e) => {
+                        const n = Number(e.target.value);
+                        setPref(
+                          "groq_asr_min_audio_chunk_sec",
+                          Number.isFinite(n) && n > 0 ? n : 10,
+                        );
+                      }}
+                    />
+                    <span className="muted">
+                      Groq bills transcription requests with a minimum duration; Scythe keeps
+                      generated audio chunks near this length and avoids shorter chunks when
+                      possible.
+                    </span>
+                  </label>
+                )}
               </div>
 
               <div>

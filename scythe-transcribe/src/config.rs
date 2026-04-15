@@ -19,9 +19,12 @@ pub const POSTPROCESS_CHUNK_MAX_USER_CHARS: usize = 4500;
 /// Post-process: max parallel chunk requests.
 pub const POSTPROCESS_MAX_PARALLEL_CHUNKS: usize = 8;
 
-/// Groq ASR: split WAVs longer than this (seconds) into multiple chunks for parallel API calls.
-/// Set to `0.0` to send the whole recording in a single request (legacy behavior).
-pub const GROQ_ASR_CHUNK_DURATION_SEC: f64 = 5.0;
+/// Groq ASR: default minimum/target audio chunk length in seconds.
+///
+/// Groq transcription is billed with a minimum duration per request, so the
+/// default keeps generated chunks near the billing floor instead of producing
+/// many short requests.
+pub const GROQ_ASR_CHUNK_DURATION_SEC: f64 = 10.0;
 
 /// When refining a nominal chunk boundary, search ±this many seconds for a low-energy pause.
 pub const GROQ_ASR_CHUNK_BOUNDARY_SEARCH_SEC: f64 = 0.85;

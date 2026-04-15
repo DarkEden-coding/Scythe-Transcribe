@@ -347,6 +347,34 @@ mod tests {
         (2.0 * std::f32::consts::PI * freq_hz * frame as f32 / sr as f32).sin() * 0.2
     }
 
+    fn silence_wav(seconds: usize, sr: u32) -> Vec<u8> {
+        let spec = WavSpec {
+            channels: 1,
+            sample_rate: sr,
+            bits_per_sample: 16,
+            sample_format: SampleFormat::Int,
+        };
+        let mut cursor = Cursor::new(Vec::new());
+        let mut w = WavWriter::new(&mut cursor, spec).unwrap();
+        for _ in 0..seconds * sr as usize {
+            w.write_sample(0i16).unwrap();
+        }
+        w.finalize().unwrap();
+        cursor.into_inner()
+    }
+
+    #[test]
+    fn minimum_chunk_duration_avoids_short_final_request() {
+        let sr = 16_000u32;
+        let eighteen_sec = silence_wav(18, sr);
+        let chunks = split_wav_for_parallel_groq(&eighteen_sec, 10.0, 0.85, 10.0).unwrap();
+        assert_eq!(chunks.len(), 1);
+
+        let twenty_two_sec = silence_wav(22, sr);
+        let chunks = split_wav_for_parallel_groq(&twenty_two_sec, 10.0, 0.85, 10.0).unwrap();
+        assert_eq!(chunks.len(), 2);
+    }
+
     /// High-energy "speech" then silence then speech; nominal cut in the silence.
     #[test]
     fn refinement_prefers_quiet_region() {

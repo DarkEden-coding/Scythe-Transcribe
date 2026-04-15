@@ -56,6 +56,7 @@ pub struct AppPreferences {
     pub transcription_provider: String,
     pub transcription_model_groq: String,
     pub transcription_model_openrouter: String,
+    pub groq_asr_min_audio_chunk_sec: f64,
     pub postprocess_enabled: bool,
     pub postprocess_prompt: String,
     pub postprocess_provider: String,
@@ -75,6 +76,7 @@ impl Default for AppPreferences {
             transcription_provider: TranscriptionProvider::Groq.as_str().to_string(),
             transcription_model_groq: "whisper-large-v3-turbo".to_string(),
             transcription_model_openrouter: String::new(),
+            groq_asr_min_audio_chunk_sec: crate::config::GROQ_ASR_CHUNK_DURATION_SEC,
             postprocess_enabled: false,
             postprocess_prompt: "Summarize the transcript in bullet points.".to_string(),
             postprocess_provider: ChatProvider::Openrouter.as_str().to_string(),
@@ -106,4 +108,19 @@ pub struct OpenRouterModelInfo {
 
 fn default_true() -> bool {
     true
+}
+
+#[cfg(test)]
+mod tests {
+    use super::AppPreferences;
+    use crate::config::GROQ_ASR_CHUNK_DURATION_SEC;
+
+    #[test]
+    fn missing_chunk_preference_uses_default() {
+        let prefs: AppPreferences = serde_json::from_str("{}").unwrap();
+        assert_eq!(
+            prefs.groq_asr_min_audio_chunk_sec,
+            GROQ_ASR_CHUNK_DURATION_SEC
+        );
+    }
 }

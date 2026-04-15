@@ -38,6 +38,8 @@ pub struct TranscribeJob {
     #[serde(default)]
     pub transcription_model_openrouter: String,
     #[serde(default)]
+    pub groq_asr_min_audio_chunk_sec: f64,
+    #[serde(default)]
     pub openrouter_transcription_instruction: String,
     #[serde(default)]
     pub keyword_replacement_spec: String,
@@ -60,6 +62,7 @@ pub fn transcribe_job_from_preferences(prefs: &AppPreferences) -> TranscribeJob 
         transcription_provider: prefs.transcription_provider.clone(),
         transcription_model_groq: prefs.transcription_model_groq.clone(),
         transcription_model_openrouter: prefs.transcription_model_openrouter.clone(),
+        groq_asr_min_audio_chunk_sec: prefs.groq_asr_min_audio_chunk_sec,
         openrouter_transcription_instruction: prefs.openrouter_transcription_instruction.clone(),
         keyword_replacement_spec: prefs.keyword_replacement_spec.clone(),
         postprocess_enabled: prefs.postprocess_enabled,
@@ -70,6 +73,14 @@ pub fn transcribe_job_from_preferences(prefs: &AppPreferences) -> TranscribeJob 
         postprocess_openrouter_reasoning_effort: prefs
             .postprocess_openrouter_reasoning_effort
             .clone(),
+    }
+}
+
+fn effective_groq_asr_min_audio_chunk_sec(raw: f64) -> f64 {
+    if raw.is_finite() && raw > 0.0 {
+        raw.clamp(1.0, 120.0)
+    } else {
+        GROQ_ASR_CHUNK_DURATION_SEC
     }
 }
 
@@ -414,13 +425,14 @@ async fn transcribe_asr_groq(
         model
     };
     let whisper_ctx = groq_asr_prompt_from_replacement_spec(&job.keyword_replacement_spec, 1000);
+    let audio_chunk_sec = effective_groq_asr_min_audio_chunk_sec(job.groq_asr_min_audio_chunk_sec);
 
-    let chunks: Vec<Vec<u8>> = if GROQ_ASR_CHUNK_DURATION_SEC > 0.0 {
+    let chunks: Vec<Vec<u8>> = if audio_chunk_sec > 0.0 {
         crate::wav_speech_chunks::split_wav_for_parallel_groq(
             raw,
-            GROQ_ASR_CHUNK_DURATION_SEC,
+            audio_chunk_sec,
             GROQ_ASR_CHUNK_BOUNDARY_SEARCH_SEC,
-            GROQ_ASR_MIN_CHUNK_SEC,
+            audio_chunk_sec.max(GROQ_ASR_MIN_CHUNK_SEC),
         )
         .unwrap_or_else(|_| vec![raw.to_vec()])
     } else {
@@ -495,6 +507,7 @@ async fn transcribe_asr_groq(
         meta.insert(k.clone(), v.clone());
     }
     meta.insert("model".to_string(), Value::String(model.to_string()));
+    meta.insert("asr_audio_chunk_sec".to_string(), json!(audio_chunk_sec));
     Ok((groq_result.text, groq_result.silence_detected, meta))
 }
 

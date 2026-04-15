@@ -137,6 +137,7 @@ def build_meta(prefs: dict, *, postprocess: bool) -> dict:
         "transcription_provider":            prefs.get("transcription_provider", "groq"),
         "transcription_model_groq":          prefs.get("transcription_model_groq", "whisper-large-v3-turbo"),
         "transcription_model_openrouter":    prefs.get("transcription_model_openrouter", ""),
+        "groq_asr_min_audio_chunk_sec":      prefs.get("groq_asr_min_audio_chunk_sec", 10),
         "openrouter_transcription_instruction": prefs.get("openrouter_transcription_instruction", ""),
         "keyword_replacement_spec":          prefs.get("keyword_replacement_spec", ""),
         "postprocess_enabled":               postprocess and prefs.get("postprocess_enabled", False),
