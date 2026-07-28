@@ -1,5 +1,6 @@
 //! Scythe-Transcribe: local API server, transcription pipeline, and desktop integration.
 
+pub mod assemblyai;
 pub mod config;
 pub mod groq;
 pub mod hotkey;

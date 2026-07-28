@@ -12,6 +12,7 @@ use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
 use tokio::sync::Semaphore;
 
+use crate::assemblyai;
 use crate::config::{
     GROQ_ASR_CHUNK_BOUNDARY_SEARCH_SEC, GROQ_ASR_CHUNK_DURATION_SEC, GROQ_ASR_MAX_PARALLEL_CHUNKS,
     GROQ_ASR_MIN_CHUNK_SEC, MAX_UPLOAD_BYTES, POSTPROCESS_CHUNK_MAX_USER_CHARS,
@@ -22,11 +23,12 @@ use crate::models::{AppPreferences, ChatProvider, TranscriptionProvider};
 use crate::openrouter;
 use crate::prompts::{OPENROUTER_TRANSCRIPTION_INSTRUCTION, OPENROUTER_TRANSCRIPTION_NONE_OUTPUT};
 use crate::settings_store::{
-    append_transcription_history, get_groq_api_key, get_openrouter_api_key,
+    append_transcription_history, get_assemblyai_api_key, get_groq_api_key, get_openrouter_api_key,
     patch_transcription_history_entry,
 };
 use crate::text_replacements::{
     apply_replacements, groq_asr_prompt_from_replacement_spec, parse_replacement_spec,
+    recognition_keyterms_from_replacement_spec,
 };
 
 #[derive(Debug, Deserialize, Serialize)]
@@ -43,6 +45,16 @@ pub struct TranscribeJob {
     pub openrouter_transcription_instruction: String,
     #[serde(default)]
     pub keyword_replacement_spec: String,
+    #[serde(default)]
+    pub assemblyai_streaming_completed: bool,
+    #[serde(default)]
+    pub assemblyai_streaming_transcript: String,
+    #[serde(default)]
+    pub assemblyai_streaming_session_id: String,
+    #[serde(default)]
+    pub assemblyai_streaming_audio_duration_sec: Option<f64>,
+    #[serde(default)]
+    pub assemblyai_streaming_finalized_turns: Option<usize>,
     #[serde(default)]
     pub postprocess_enabled: bool,
     #[serde(default)]
@@ -65,6 +77,11 @@ pub fn transcribe_job_from_preferences(prefs: &AppPreferences) -> TranscribeJob 
         groq_asr_min_audio_chunk_sec: prefs.groq_asr_min_audio_chunk_sec,
         openrouter_transcription_instruction: prefs.openrouter_transcription_instruction.clone(),
         keyword_replacement_spec: prefs.keyword_replacement_spec.clone(),
+        assemblyai_streaming_completed: false,
+        assemblyai_streaming_transcript: String::new(),
+        assemblyai_streaming_session_id: String::new(),
+        assemblyai_streaming_audio_duration_sec: None,
+        assemblyai_streaming_finalized_turns: None,
         postprocess_enabled: prefs.postprocess_enabled,
         postprocess_prompt: prefs.postprocess_prompt.clone(),
         postprocess_provider: prefs.postprocess_provider.clone(),
@@ -406,6 +423,54 @@ pub struct TranscribeResponse {
     pub total_ms: f64,
 }
 
+/// Use a completed live stream or recover from the retained WAV through AssemblyAI.
+async fn transcribe_asr_assemblyai(
+    client: &reqwest::Client,
+    job: &TranscribeJob,
+    raw: &[u8],
+    audio_duration_sec: Option<f64>,
+) -> Result<(String, bool, HashMap<String, Value>), (StatusCode, String)> {
+    let key = get_assemblyai_api_key();
+    if key.is_empty() {
+        return Err((
+            StatusCode::BAD_REQUEST,
+            "AssemblyAI API key not configured.".to_string(),
+        ));
+    }
+    if job.assemblyai_streaming_completed {
+        let text = job.assemblyai_streaming_transcript.trim().to_string();
+        let mut metadata = HashMap::new();
+        metadata.insert("provider".to_string(), json!("assemblyai"));
+        metadata.insert("mode".to_string(), json!("streaming"));
+        metadata.insert("model".to_string(), json!("universal-3-5-pro"));
+        if !job.assemblyai_streaming_session_id.trim().is_empty() {
+            metadata.insert(
+                "session_id".to_string(),
+                json!(job.assemblyai_streaming_session_id.trim()),
+            );
+        }
+        if let Some(duration) = job.assemblyai_streaming_audio_duration_sec {
+            metadata.insert("audio_duration".to_string(), json!(duration));
+        }
+        if let Some(turns) = job.assemblyai_streaming_finalized_turns {
+            metadata.insert("finalized_turns".to_string(), json!(turns));
+        }
+        let silence = text.is_empty();
+        metadata.insert("is_silence".to_string(), json!(silence));
+        return Ok((text, silence, metadata));
+    }
+
+    let keyterms = recognition_keyterms_from_replacement_spec(&job.keyword_replacement_spec, 100);
+    let result =
+        assemblyai::transcribe_recorded_fallback(client, &key, raw, audio_duration_sec, &keyterms)
+            .await
+            .map_err(|error| (StatusCode::BAD_GATEWAY, error.to_string()))?;
+    let silence = result.text.trim().is_empty();
+    let mut metadata = result.metadata;
+    metadata.insert("is_silence".to_string(), json!(silence));
+    Ok((result.text, silence, metadata))
+}
+
 async fn transcribe_asr_groq(
     client: &reqwest::Client,
     job: &TranscribeJob,
@@ -572,6 +637,10 @@ pub async fn transcribe_wav_bytes(
 
     let t_asr_start = std::time::Instant::now();
     let (transcript, silence_detected, asr_metadata) = match provider {
+        TranscriptionProvider::Assemblyai => {
+            let (t, s, m) = transcribe_asr_assemblyai(client, job, raw, audio_duration_sec).await?;
+            (t, s, Some(m))
+        }
         TranscriptionProvider::Groq => {
             let (t, s, m) = transcribe_asr_groq(client, job, raw).await?;
             (t, s, Some(m))

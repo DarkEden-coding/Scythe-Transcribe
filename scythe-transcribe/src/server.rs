@@ -25,9 +25,9 @@ use crate::openrouter;
 use crate::pipeline::{postprocess_only_http, transcribe_wav_bytes, TranscribeJob};
 use crate::runtime_icon;
 use crate::settings_store::{
-    get_groq_api_key, get_openrouter_api_key, load_json_cache, load_preferences,
-    load_transcription_history, openrouter_models_cache_path, save_json_cache, save_preferences,
-    set_groq_api_key, set_openrouter_api_key,
+    get_assemblyai_api_key, get_groq_api_key, get_openrouter_api_key, load_json_cache,
+    load_preferences, load_transcription_history, openrouter_models_cache_path, save_json_cache,
+    save_preferences, set_assemblyai_api_key, set_groq_api_key, set_openrouter_api_key,
 };
 use crate::startup;
 
@@ -93,6 +93,7 @@ pub fn build_router_with_state(state: AppState) -> Router {
         .route("/api/audio-input-devices", get(audio_input_devices))
         .route("/api/keys", get(get_keys).put(put_keys))
         .route("/api/groq/chat-models", get(groq_chat_models))
+        .route("/api/assemblyai/token", get(assemblyai_streaming_token))
         .route("/api/openrouter/models", get(openrouter_models_cached))
         .route(
             "/api/openrouter/models/refresh",
@@ -189,6 +190,7 @@ async fn audio_input_devices() -> Json<Value> {
 
 async fn get_keys() -> Json<Value> {
     Json(json!({
+        "assemblyai_configured": !get_assemblyai_api_key().trim().is_empty(),
         "groq_configured": !get_groq_api_key().trim().is_empty(),
         "openrouter_configured": !get_openrouter_api_key().trim().is_empty(),
     }))
@@ -196,11 +198,15 @@ async fn get_keys() -> Json<Value> {
 
 #[derive(serde::Deserialize)]
 struct KeysUpdate {
+    assemblyai: Option<String>,
     groq: Option<String>,
     openrouter: Option<String>,
 }
 
 async fn put_keys(Json(body): Json<KeysUpdate>) -> Json<Value> {
+    if let Some(key) = body.assemblyai {
+        let _ = set_assemblyai_api_key(key.trim());
+    }
     if let Some(k) = body.groq {
         let _ = set_groq_api_key(k.trim());
     }
@@ -208,6 +214,37 @@ async fn put_keys(Json(body): Json<KeysUpdate>) -> Json<Value> {
         let _ = set_openrouter_api_key(k.trim());
     }
     get_keys().await
+}
+
+/// Mint a single-use browser token without exposing the stored AssemblyAI key.
+async fn assemblyai_streaming_token(State(st): State<AppState>) -> Result<Json<Value>, ApiError> {
+    let key = get_assemblyai_api_key();
+    if key.is_empty() {
+        return Err(ApiError("AssemblyAI API key not configured.".to_string()));
+    }
+    let response = st
+        .http
+        .get("https://streaming.assemblyai.com/v3/token?expires_in_seconds=60&max_session_duration_seconds=10800")
+        .header(reqwest::header::AUTHORIZATION, key)
+        .send()
+        .await
+        .map_err(|error| ApiError(format!("AssemblyAI token request failed: {error}")))?;
+    let status = response.status();
+    let body: Value = response
+        .json()
+        .await
+        .map_err(|error| ApiError(format!("Invalid AssemblyAI token response: {error}")))?;
+    if !status.is_success() {
+        let message = body
+            .get("error")
+            .or_else(|| body.get("message"))
+            .and_then(Value::as_str)
+            .unwrap_or("unknown error");
+        return Err(ApiError(format!(
+            "AssemblyAI token returned {status}: {message}"
+        )));
+    }
+    Ok(Json(body))
 }
 
 async fn groq_chat_models(State(st): State<AppState>) -> Json<Value> {

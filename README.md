@@ -1,6 +1,8 @@
 # Scythe-Transcribe
 
-Local speech-to-text using Groq and/or OpenRouter, with a browser UI served from a small Rust app (tray icon on desktop, optional server-only mode).
+Local speech-to-text using Groq, OpenRouter, or AssemblyAI, with a browser UI served from a small Rust app (tray icon on desktop, optional server-only mode).
+
+AssemblyAI uses edge-routed Universal-3.5 Pro streaming with the minimum-latency preset. Only finalized turns are combined and passed through the existing replacement and optional LLM post-processing pipeline. The app retains each recording and automatically uses AssemblyAI Sync STT for failed streams up to 120 seconds, or pre-recorded STT for longer recordings.
 
 ## Prerequisites
 
@@ -60,7 +62,7 @@ Open **[http://127.0.0.1:8765/](http://127.0.0.1:8765/)** in a browser. The app 
 
 ### Environment
 
-- `**GROQ_API_KEY`** / `**OPENROUTER_API_KEY**`: used for transcription when not set in the app settings (a `.env` file in the project directory is loaded automatically if present).
+- `**ASSEMBLYAI_API_KEY**` / `**GROQ_API_KEY**` / `**OPENROUTER_API_KEY**`: used for transcription when not set in the app settings (a `.env` file in the project directory is loaded automatically if present).
 - `**SCYTHE_SERVER_ONLY=1**` (or `**SCYTHE_TRAY=0**`): run without the system tray; only the HTTP server runs.
 - `**SCYTHE_STATIC_ROOT**`: override the directory that contains `index.html` for the SPA.
 - `**SCYTHE_CONFIG_DIR**`: override where preferences and API key storage live.

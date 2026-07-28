@@ -1,6 +1,6 @@
-import type { CSSProperties, KeyboardEvent as ReactKeyboardEvent, PointerEvent } from "react";
+import type { CSSProperties, PointerEvent } from "react";
 import { useCallback, useEffect, useMemo, useRef, useState } from "react";
-import { startMicRecording } from "./audio";
+import { startMicRecording, type MicSession } from "./audio";
 import { OpenRouterModelPicker, type OrModel } from "./OpenRouterModelPicker";
 
 type TabId = "general" | "keys" | "transcribe" | "postprocess" | "stats" | "output";
@@ -85,6 +85,7 @@ type AppPreferences = {
 };
 
 type KeysPublic = {
+  assemblyai_configured: boolean;
   groq_configured: boolean;
   openrouter_configured: boolean;
 };
@@ -547,16 +548,6 @@ function formatDiagnosticBool(value?: boolean): string {
   return value ? "Yes" : "No";
 }
 
-function preventModifiedButtonActivation(e: ReactKeyboardEvent<HTMLButtonElement>) {
-  if (
-    (e.key === " " || e.key === "Enter" || e.code === "Space" || e.code === "Enter") &&
-    (e.ctrlKey || e.altKey || e.shiftKey || e.metaKey)
-  ) {
-    e.preventDefault();
-    e.stopPropagation();
-  }
-}
-
 /** Matches `text_replacements.parse_replacement_spec` (first arrow only). */
 const KEYWORD_LINE =
   /^(.*?)\s*(?:->|=>|→|⇒|\t)\s*(.*)$/s;
@@ -588,6 +579,24 @@ function serializeKeywordPairs(rows: KeywordRow[]): string {
   return lines.join("\n");
 }
 
+/** Build the same bounded recognition-hint list used by the Rust pipeline. */
+function recognitionKeyterms(rows: KeywordRow[]): string[] {
+  const seen = new Set<string>();
+  const terms: string[] = [];
+  for (const row of rows) {
+    for (const rawTerm of [row.from, row.to]) {
+      const term = rawTerm.trim();
+      if (!term || term.split(/\s+/).length > 6) continue;
+      const normalized = term.toLocaleLowerCase();
+      if (seen.has(normalized)) continue;
+      seen.add(normalized);
+      terms.push(term);
+      if (terms.length >= 100) return terms;
+    }
+  }
+  return terms;
+}
+
 async function apiJson<T>(path: string, init?: RequestInit): Promise<T> {
   const r = await fetch(path, {
     ...init,
@@ -605,9 +614,11 @@ async function apiJson<T>(path: string, init?: RequestInit): Promise<T> {
 export function App() {
   const [prefs, setPrefs] = useState<AppPreferences>(defaultPrefs);
   const [keys, setKeys] = useState<KeysPublic>({
+    assemblyai_configured: false,
     groq_configured: false,
     openrouter_configured: false,
   });
+  const [assemblyaiKeyInput, setAssemblyaiKeyInput] = useState("");
   const [groqKeyInput, setGroqKeyInput] = useState("");
   const [orKeyInput, setOrKeyInput] = useState("");
   const [orModels, setOrModels] = useState<OrModel[]>([]);
@@ -624,7 +635,7 @@ export function App() {
   const [statusColor, setStatusColor] = useState("#666666");
   const [busy, setBusy] = useState(false);
   const [recording, setRecording] = useState(false);
-  const micRef = useRef<{ stop: () => Promise<Blob> } | null>(null);
+  const micRef = useRef<MicSession | null>(null);
   const [hydrated, setHydrated] = useState(false);
   const [activeTab, setActiveTab] = useState<TabId>("keys");
   const [bgPos, setBgPos] = useState({ x: 50, y: 40 });
@@ -870,10 +881,15 @@ export function App() {
   }, [prefs, hydrated]);
 
   const saveKeys = async () => {
-    const body: { groq?: string | null; openrouter?: string | null } = {};
+    const body: {
+      assemblyai?: string | null;
+      groq?: string | null;
+      openrouter?: string | null;
+    } = {};
+    if (assemblyaiKeyInput.trim()) body.assemblyai = assemblyaiKeyInput.trim();
     if (groqKeyInput.trim()) body.groq = groqKeyInput.trim();
     if (orKeyInput.trim()) body.openrouter = orKeyInput.trim();
-    if (!body.groq && !body.openrouter) {
+    if (!body.assemblyai && !body.groq && !body.openrouter) {
       setStatus("Enter a key to save.");
       setStatusColor("#ff9800");
       return;
@@ -885,6 +901,7 @@ export function App() {
         body: JSON.stringify(body),
       });
       setKeys(k);
+      setAssemblyaiKeyInput("");
       setGroqKeyInput("");
       setOrKeyInput("");
       setStatus("Keys saved.");
@@ -951,7 +968,13 @@ export function App() {
     if (busy) return;
     if (!recording) {
       try {
-        const session = await startMicRecording(prefsRef.current.audio_input_device);
+        const currentPreferences = prefsRef.current;
+        const session = await startMicRecording(
+          currentPreferences.audio_input_device,
+          currentPreferences.transcription_provider === "assemblyai"
+            ? { keyterms: recognitionKeyterms(keywordRows) }
+            : undefined,
+        );
         micRef.current = session;
         setRecording(true);
         setStatus("Recording…");
@@ -970,8 +993,9 @@ export function App() {
     setStatus("Transcribing…");
     setStatusColor("#ff9800");
     try {
-      const blob = await session.stop();
+      const recordingResult = await session.stop();
       const p = prefsRef.current;
+      const stream = recordingResult.assemblyaiStreaming;
       const meta = {
         transcription_provider: p.transcription_provider,
         transcription_model_groq: p.transcription_model_groq,
@@ -979,6 +1003,11 @@ export function App() {
         groq_asr_min_audio_chunk_sec: p.groq_asr_min_audio_chunk_sec,
         openrouter_transcription_instruction: p.openrouter_transcription_instruction,
         keyword_replacement_spec: p.keyword_replacement_spec,
+        assemblyai_streaming_completed: stream?.completed ?? false,
+        assemblyai_streaming_transcript: stream?.transcript ?? "",
+        assemblyai_streaming_session_id: stream?.sessionId ?? "",
+        assemblyai_streaming_audio_duration_sec: stream?.audioDurationSec ?? null,
+        assemblyai_streaming_finalized_turns: stream?.finalizedTurns ?? null,
         postprocess_enabled: p.postprocess_enabled,
         postprocess_prompt: p.postprocess_prompt,
         postprocess_provider: p.postprocess_provider,
@@ -988,7 +1017,7 @@ export function App() {
       };
       const fd = new FormData();
       fd.set("meta", JSON.stringify(meta));
-      fd.set("audio", blob, "recording.wav");
+      fd.set("audio", recordingResult.audio, "recording.wav");
       const r = await fetch("/api/transcribe", { method: "POST", body: fd });
       if (!r.ok) {
         throw new Error(await r.text());
@@ -1007,7 +1036,7 @@ export function App() {
     } finally {
       setBusy(false);
     }
-  }, [busy, recording]);
+  }, [busy, keywordRows, recording]);
 
   useEffect(() => {
     if (!capturingToggleRecording) return;
@@ -1027,6 +1056,7 @@ export function App() {
     return () => window.removeEventListener("keydown", onKey, true);
   }, [capturingToggleRecording, setPref]);
 
+  const isAssemblyai = prefs.transcription_provider === "assemblyai";
   const isGroq = prefs.transcription_provider === "groq";
   const postGroq = prefs.postprocess_provider === "groq";
   const actualIconState: RuntimeIconState = busy
@@ -1485,6 +1515,17 @@ export function App() {
             <h2 className="section-title">API keys (stored in local file)</h2>
             <div className="panel-keys-fields">
               <label className="panel-keys-label">
+                AssemblyAI API key
+                <input
+                  type="password"
+                  className="input-field"
+                  value={assemblyaiKeyInput}
+                  onChange={(e) => setAssemblyaiKeyInput(e.target.value)}
+                  placeholder={keys.assemblyai_configured ? "(saved)" : ""}
+                  autoComplete="off"
+                />
+              </label>
+              <label className="panel-keys-label">
                 Groq API key
                 <input
                   type="password"
@@ -1516,7 +1557,8 @@ export function App() {
               </button>
             </div>
             <p className="muted panel-keys-footnote">
-              Groq: {keys.groq_configured ? "key saved" : "no key"} · OpenRouter:{" "}
+              AssemblyAI: {keys.assemblyai_configured ? "key saved" : "no key"} · Groq:{" "}
+              {keys.groq_configured ? "key saved" : "no key"} · OpenRouter:{" "}
               {keys.openrouter_configured ? "key saved" : "no key"}
             </p>
           </div>
@@ -1539,12 +1581,22 @@ export function App() {
                       value={prefs.transcription_provider}
                       onChange={(e) => setPref("transcription_provider", e.target.value)}
                     >
-                      <option value="groq">Groq</option>
+                                            <option value="groq">Groq</option>
+                      <option value="assemblyai">AssemblyAI</option>
                       <option value="openrouter">OpenRouter</option>
                     </select>
                   </label>
                   <div className="provider-model-toolbar-main">
-                    {isGroq ? (
+                    {isAssemblyai ? (
+                      <label className="field-inline">
+                        <span className="field-inline-label">AssemblyAI model</span>
+                        <input
+                          className="input-field input-field--toolbar"
+                          value="Universal-3.5 Pro · minimum latency"
+                          readOnly
+                        />
+                      </label>
+                    ) : isGroq ? (
                       <label className="field-inline">
                         <span className="field-inline-label">Groq model</span>
                         <select
@@ -1572,7 +1624,12 @@ export function App() {
                   </div>
                 </div>
                 <div className="provider-model-extra">
-                  {isGroq ? (
+                  {isAssemblyai ? (
+                    <span className="muted">
+                      Streams finalized English turns through edge routing. If streaming fails,
+                      Scythe retries the retained recording with Sync or pre-recorded STT.
+                    </span>
+                  ) : isGroq ? (
                     groqModelInDefaults && !groqTranscribeCustomOpen ? (
                       <button
                         type="button"
@@ -1657,7 +1714,12 @@ export function App() {
                     </div>
                   )}
                 </div>
-                {!isGroq ? (
+                {isAssemblyai ? (
+                  <p className="muted" style={{ marginTop: "var(--space-4)" }}>
+                    Partial transcripts are not displayed. Final turns are combined before keyword
+                    replacement and optional LLM post-processing.
+                  </p>
+                ) : !isGroq ? (
                   <label className="field-inline" style={{ marginTop: "var(--space-4)" }}>
                     <span className="field-inline-label">Transcription instruction</span>
                     <textarea
@@ -1700,8 +1762,8 @@ export function App() {
                 <h2 className="section-title">Keyword dictionary</h2>
                 <p className="muted">
                   Replace mistaken words or phrases in the raw transcript (before any LLM step). Longer
-                  phrases are applied first. With Groq transcription, these terms are also sent as a
-                  Whisper prompt so recognition can follow your vocabulary.
+                  phrases are applied first. With Groq or AssemblyAI transcription, these terms are
+                  also sent as recognition hints so the model can follow your vocabulary.
                 </p>
                 {keywordRows.length === 0 ? (
                   <p className="muted keyword-dict-empty">No rules yet. Add a replacement below.</p>

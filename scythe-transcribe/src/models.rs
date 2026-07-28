@@ -7,6 +7,7 @@ use crate::prompts::OPENROUTER_TRANSCRIPTION_INSTRUCTION;
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "lowercase")]
 pub enum TranscriptionProvider {
+    Assemblyai,
     Groq,
     Openrouter,
 }
@@ -15,6 +16,7 @@ impl TranscriptionProvider {
     #[must_use]
     pub fn as_str(&self) -> &'static str {
         match self {
+            Self::Assemblyai => "assemblyai",
             Self::Groq => "groq",
             Self::Openrouter => "openrouter",
         }
@@ -22,7 +24,9 @@ impl TranscriptionProvider {
 
     #[must_use]
     pub fn parse(s: &str) -> Option<Self> {
-        if s == Self::Groq.as_str() {
+        if s == Self::Assemblyai.as_str() {
+            Some(Self::Assemblyai)
+        } else if s == Self::Groq.as_str() {
             Some(Self::Groq)
         } else if s == Self::Openrouter.as_str() {
             Some(Self::Openrouter)
@@ -114,6 +118,13 @@ fn default_true() -> bool {
 mod tests {
     use super::AppPreferences;
     use crate::config::GROQ_ASR_CHUNK_DURATION_SEC;
+
+    #[test]
+    fn assemblyai_provider_round_trips() {
+        let provider = super::TranscriptionProvider::parse("assemblyai").unwrap();
+        assert_eq!(provider, super::TranscriptionProvider::Assemblyai);
+        assert_eq!(provider.as_str(), "assemblyai");
+    }
 
     #[test]
     fn missing_chunk_preference_uses_default() {

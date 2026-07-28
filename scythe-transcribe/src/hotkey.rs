@@ -18,11 +18,14 @@ use rdev::{simulate, Event, EventType, Key};
 use serde::Serialize;
 use serde_json::{json, Value};
 
+use crate::assemblyai::{StreamingAudioSender, StreamingSession};
+use crate::models::TranscriptionProvider;
 use crate::pipeline::{
     patch_history_timings, text_to_paste, transcribe_job_from_preferences, transcribe_wav_bytes,
 };
 use crate::runtime_icon::{self, ICON_IDLE, ICON_PROCESSING, ICON_RECORDING};
-use crate::settings_store::load_preferences;
+use crate::settings_store::{get_assemblyai_api_key, load_preferences};
+use crate::text_replacements::recognition_keyterms_from_replacement_spec;
 
 static LISTENER_STARTED: OnceLock<()> = OnceLock::new();
 static STATUS: Lazy<Mutex<Value>> = Lazy::new(|| {
@@ -261,19 +264,78 @@ fn float32_mono_to_wav_bytes(samples: &[f32], sample_rate: u32) -> Vec<u8> {
     cursor.into_inner()
 }
 
+/// Buffers native callback samples into AssemblyAI's minimum 50 ms PCM chunks.
+struct AssemblyAudioChunker {
+    sender: StreamingAudioSender,
+    pending: Vec<u8>,
+    chunk_bytes: usize,
+}
+
+impl AssemblyAudioChunker {
+    /// Create a chunker for mono PCM16 at the capture device's sample rate.
+    fn new(sender: StreamingAudioSender, sample_rate: u32) -> Self {
+        Self {
+            sender,
+            pending: Vec::new(),
+            chunk_bytes: ((sample_rate as usize * 50) / 1000).max(1) * 2,
+        }
+    }
+
+    /// Add normalized mono samples and send every complete 50 ms chunk.
+    fn push(&mut self, samples: &[f32]) {
+        self.pending.reserve(samples.len() * 2);
+        for sample in samples {
+            let normalized = sample.clamp(-1.0, 1.0);
+            let pcm = if normalized < 0.0 {
+                (normalized * 32768.0).round() as i16
+            } else {
+                (normalized * 32767.0).round() as i16
+            };
+            self.pending.extend_from_slice(&pcm.to_le_bytes());
+        }
+        while self.pending.len() >= self.chunk_bytes {
+            let remainder = self.pending.split_off(self.chunk_bytes);
+            let chunk = std::mem::replace(&mut self.pending, remainder);
+            let _ = self.sender.send_audio(chunk);
+        }
+    }
+
+    /// Pad the final sub-50 ms fragment so the server accepts it.
+    fn flush_padded(&mut self) {
+        if self.pending.is_empty() {
+            return;
+        }
+        self.pending.resize(self.chunk_bytes, 0);
+        let chunk = std::mem::take(&mut self.pending);
+        let _ = self.sender.send_audio(chunk);
+    }
+}
+
+type CaptureReady = Result<
+    (
+        u32,
+        Option<StreamingSession>,
+        Option<Arc<Mutex<AssemblyAudioChunker>>>,
+    ),
+    String,
+>;
+
 struct AudioCapture {
     stop_tx: mpsc::Sender<()>,
     join: Option<thread::JoinHandle<()>>,
     samples: Arc<Mutex<Vec<f32>>>,
     sample_rate: u32,
+    assemblyai_session: Option<StreamingSession>,
+    assemblyai_chunker: Option<Arc<Mutex<AssemblyAudioChunker>>>,
 }
 
 impl AudioCapture {
+    /// Start native capture and, when selected, connect AssemblyAI before recording begins.
     fn start() -> Result<Self, String> {
         let prefs = load_preferences();
         let samples = Arc::new(Mutex::new(Vec::<f32>::new()));
         let samples_thread = samples.clone();
-        let (ready_tx, ready_rx) = mpsc::sync_channel::<Result<u32, String>>(1);
+        let (ready_tx, ready_rx) = mpsc::sync_channel::<CaptureReady>(1);
         let (stop_tx, stop_rx) = mpsc::channel::<()>();
 
         let join = thread::spawn(move || {
@@ -283,30 +345,61 @@ impl AudioCapture {
                     .ok_or_else(|| "no input device".to_string())?;
                 let cfg = device.default_input_config().map_err(|e| e.to_string())?;
                 let sample_rate = cfg.sample_rate().0;
-                let stream_config = cfg.clone().into();
+                let channels = cfg.channels() as usize;
+                let sample_format = cfg.sample_format();
+                let stream_config = cfg.into();
+                let assemblyai_session = if TranscriptionProvider::parse(
+                    &prefs.transcription_provider,
+                ) == Some(TranscriptionProvider::Assemblyai)
+                {
+                    let key = get_assemblyai_api_key();
+                    let keyterms = recognition_keyterms_from_replacement_spec(
+                        &prefs.keyword_replacement_spec,
+                        100,
+                    );
+                    match TOKIO.block_on(StreamingSession::connect(&key, sample_rate, &keyterms)) {
+                        Ok(session) => Some(session),
+                        Err(error) => {
+                            tracing::warn!(
+                                "AssemblyAI stream setup failed; retaining audio for fallback: {error}"
+                            );
+                            None
+                        }
+                    }
+                } else {
+                    None
+                };
+                let assemblyai_chunker = assemblyai_session.as_ref().map(|session| {
+                    Arc::new(Mutex::new(AssemblyAudioChunker::new(
+                        session.audio_sender(),
+                        sample_rate,
+                    )))
+                });
                 let stream = build_input_stream(
                     &device,
                     &stream_config,
-                    cfg.sample_format(),
+                    sample_format,
+                    channels,
                     samples_thread,
+                    assemblyai_chunker.clone(),
                 )?;
                 stream.play().map_err(|e| e.to_string())?;
-                Ok((sample_rate, stream))
+                Ok((sample_rate, stream, assemblyai_session, assemblyai_chunker))
             })();
 
             match result {
-                Ok((sample_rate, stream)) => {
-                    let _ = ready_tx.send(Ok(sample_rate));
+                Ok((sample_rate, stream, session, chunker)) => {
+                    let _ = ready_tx.send(Ok((sample_rate, session, chunker)));
                     let _ = stop_rx.recv();
                     let _ = stream.pause();
                 }
-                Err(e) => {
-                    let _ = ready_tx.send(Err(e));
+                Err(error) => {
+                    let _ = ready_tx.send(Err(error));
                 }
             }
         });
 
-        let sample_rate = ready_rx
+        let (sample_rate, assemblyai_session, assemblyai_chunker) = ready_rx
             .recv()
             .map_err(|_| "audio capture thread stopped".to_string())??;
         Ok(Self {
@@ -314,9 +407,12 @@ impl AudioCapture {
             join: Some(join),
             samples,
             sample_rate,
+            assemblyai_session,
+            assemblyai_chunker,
         })
     }
 
+    /// Stop and join the native audio callback thread.
     fn stop_capture_thread(&mut self) {
         let _ = self.stop_tx.send(());
         if let Some(join) = self.join.take() {
@@ -324,11 +420,17 @@ impl AudioCapture {
         }
     }
 
-    fn stop(mut self) -> (Vec<f32>, u32) {
+    /// Return retained mono samples and the live session for asynchronous finalization.
+    fn stop(mut self) -> (Vec<f32>, u32, Option<StreamingSession>) {
         self.stop_capture_thread();
+        if let Some(chunker) = &self.assemblyai_chunker {
+            if let Ok(mut chunker) = chunker.lock() {
+                chunker.flush_padded();
+            }
+        }
         let rate = self.sample_rate;
-        let v = self.samples.lock().map(|g| g.clone()).unwrap_or_default();
-        (v, rate)
+        let samples = self.samples.lock().map(|g| g.clone()).unwrap_or_default();
+        (samples, rate, self.assemblyai_session.take())
     }
 }
 
@@ -338,61 +440,86 @@ impl Drop for AudioCapture {
     }
 }
 
+/// Downmix one interleaved callback to mono, retain it, and feed the live chunker.
+fn record_input_values<I>(
+    values: I,
+    channels: usize,
+    samples: &Arc<Mutex<Vec<f32>>>,
+    assemblyai_chunker: &Option<Arc<Mutex<AssemblyAudioChunker>>>,
+) where
+    I: IntoIterator<Item = f32>,
+{
+    let interleaved = values.into_iter().collect::<Vec<_>>();
+    let channel_count = channels.max(1);
+    let mut mono = Vec::with_capacity(interleaved.len() / channel_count);
+    for frame in interleaved.chunks(channel_count) {
+        mono.push(frame.iter().sum::<f32>() / frame.len() as f32);
+    }
+    if let Ok(mut retained) = samples.lock() {
+        retained.extend_from_slice(&mono);
+    }
+    if let Some(chunker) = assemblyai_chunker {
+        if let Ok(mut chunker) = chunker.lock() {
+            chunker.push(&mono);
+        }
+    }
+}
+
+/// Build a native input stream for the device's concrete sample format.
 fn build_input_stream(
     device: &Device,
     cfg: &cpal::StreamConfig,
     sample_format: SampleFormat,
+    channels: usize,
     samples: Arc<Mutex<Vec<f32>>>,
+    assemblyai_chunker: Option<Arc<Mutex<AssemblyAudioChunker>>>,
 ) -> Result<cpal::Stream, String> {
     match sample_format {
-        SampleFormat::F32 => {
-            let samples2 = samples.clone();
-            device
-                .build_input_stream(
-                    cfg,
-                    move |data: &[f32], _| {
-                        if let Ok(mut g) = samples2.lock() {
-                            for s in data.iter().cloned() {
-                                g.push(s.to_sample::<f32>());
-                            }
-                        }
-                    },
-                    |_e| {},
-                    None,
-                )
-                .map_err(|e| e.to_string())
-        }
-        SampleFormat::I16 => {
-            let samples2 = samples.clone();
-            device
-                .build_input_stream(
-                    cfg,
-                    move |data: &[i16], _| {
-                        if let Ok(mut g) = samples2.lock() {
-                            for s in data.iter().cloned() {
-                                g.push(s.to_sample::<f32>());
-                            }
-                        }
-                    },
-                    |_e| {},
-                    None,
-                )
-                .map_err(|e| e.to_string())
-        }
+        SampleFormat::F32 => device
+            .build_input_stream(
+                cfg,
+                move |data: &[f32], _| {
+                    record_input_values(
+                        data.iter().copied(),
+                        channels,
+                        &samples,
+                        &assemblyai_chunker,
+                    );
+                },
+                |_error| {},
+                None,
+            )
+            .map_err(|error| error.to_string()),
+        SampleFormat::I16 => device
+            .build_input_stream(
+                cfg,
+                move |data: &[i16], _| {
+                    record_input_values(
+                        data.iter().copied().map(|sample| sample.to_sample::<f32>()),
+                        channels,
+                        &samples,
+                        &assemblyai_chunker,
+                    );
+                },
+                |_error| {},
+                None,
+            )
+            .map_err(|error| error.to_string()),
         SampleFormat::U16 => device
             .build_input_stream(
                 cfg,
                 move |data: &[u16], _| {
-                    if let Ok(mut g) = samples.lock() {
-                        for s in data {
-                            g.push((*s as f32 / 32768.0) - 1.0);
-                        }
-                    }
+                    record_input_values(
+                        data.iter().map(|sample| (*sample as f32 / 32768.0) - 1.0),
+                        channels,
+                        &samples,
+                        &assemblyai_chunker,
+                    );
                 },
-                |_e| {},
+                |_error| {},
                 None,
             )
-            .map_err(|e| e.to_string()),
+            .map_err(|error| error.to_string()),
         _ => Err("unsupported sample format".to_string()),
     }
 }
@@ -527,14 +654,36 @@ impl HotkeyState {
 
 fn transcribe_wav_on_thread(
     wav: Vec<u8>,
+    assemblyai_session: Option<StreamingSession>,
     transcribing: Arc<AtomicBool>,
     suppress_until: Arc<Mutex<Instant>>,
 ) {
     thread::spawn(move || {
         let prefs = load_preferences();
-        let job = transcribe_job_from_preferences(&prefs);
+        let mut job = transcribe_job_from_preferences(&prefs);
         let http = HTTP.clone();
-        let result = TOKIO.block_on(async { transcribe_wav_bytes(&http, &job, &wav).await });
+        let result = TOKIO.block_on(async {
+            if let Some(session) = assemblyai_session {
+                match session.finish().await {
+                    Ok(stream) => {
+                        job.assemblyai_streaming_completed = true;
+                        job.assemblyai_streaming_transcript = stream.text;
+                        job.assemblyai_streaming_session_id =
+                            stream.session_id.unwrap_or_default();
+                        job.assemblyai_streaming_audio_duration_sec =
+                            stream.audio_duration_seconds;
+                        job.assemblyai_streaming_finalized_turns =
+                            Some(stream.finalized_turns);
+                    }
+                    Err(error) => {
+                        tracing::warn!(
+                            "AssemblyAI stream finalization failed; using recorded fallback: {error}"
+                        );
+                    }
+                }
+            }
+            transcribe_wav_bytes(&http, &job, &wav).await
+        });
         let t_after_pipeline = Instant::now();
         match result {
             Ok(res) => {
@@ -587,10 +736,10 @@ fn finish_recording(
     update_status(|s| {
         s["last_recording_stopped_at"] = json!(now);
     });
-    let (samples, rate) = if let Some(c) = cap {
-        c.stop()
+    let (samples, rate, assemblyai_session) = if let Some(capture) = cap {
+        capture.stop()
     } else {
-        (Vec::new(), 16_000)
+        (Vec::new(), 16_000, None)
     };
     let min_samps = (rate as usize * 12) / 100;
     if samples.len() >= min_samps
@@ -603,7 +752,7 @@ fn finish_recording(
         let wav = float32_mono_to_wav_bytes(&samples, rate);
         let tr = transcribing.clone();
         let sup = suppress_until.clone();
-        transcribe_wav_on_thread(wav, tr, sup);
+        transcribe_wav_on_thread(wav, assemblyai_session, tr, sup);
     } else {
         set_capture_state("idle");
         runtime_icon::set_icon_state(ICON_IDLE);

@@ -111,6 +111,22 @@ fn save_api_keys_file(keys: &HashMap<String, String>) -> anyhow::Result<()> {
 }
 
 #[must_use]
+pub fn get_assemblyai_api_key() -> String {
+    let data = load_api_keys_file();
+    if let Some(key) = data.get("assemblyai") {
+        let key = key.trim();
+        if !key.is_empty() {
+            return key.to_string();
+        }
+    }
+    ensure_dotenv();
+    std::env::var("ASSEMBLYAI_API_KEY")
+        .unwrap_or_default()
+        .trim()
+        .to_string()
+}
+
+#[must_use]
 pub fn get_groq_api_key() -> String {
     let data = load_api_keys_file();
     if let Some(k) = data.get("groq") {
@@ -140,6 +156,12 @@ pub fn get_openrouter_api_key() -> String {
         .unwrap_or_default()
         .trim()
         .to_string()
+}
+
+pub fn set_assemblyai_api_key(key: &str) -> anyhow::Result<()> {
+    let mut data = load_api_keys_file();
+    data.insert("assemblyai".to_string(), key.to_string());
+    save_api_keys_file(&data)
 }
 
 pub fn set_groq_api_key(key: &str) -> anyhow::Result<()> {

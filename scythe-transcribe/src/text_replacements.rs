@@ -74,6 +74,29 @@ pub fn groq_asr_prompt_from_replacement_spec(spec: &str, max_chars: usize) -> Op
     Some(format!("{prefix}{truncated}…"))
 }
 
+/// Build ordered, deduplicated recognition terms from both sides of replacement rules.
+#[must_use]
+pub fn recognition_keyterms_from_replacement_spec(spec: &str, max_terms: usize) -> Vec<String> {
+    let mut seen = std::collections::HashSet::new();
+    let mut terms = Vec::new();
+    for (source, replacement) in parse_replacement_spec(spec) {
+        for term in [source, replacement] {
+            let term = term.trim();
+            if term.is_empty() || term.split_whitespace().count() > 6 {
+                continue;
+            }
+            let normalized = term.to_lowercase();
+            if seen.insert(normalized) {
+                terms.push(term.to_string());
+                if terms.len() >= max_terms {
+                    return terms;
+                }
+            }
+        }
+    }
+    terms
+}
+
 /// Apply replacements longest-first.
 #[must_use]
 pub fn apply_replacements(text: &str, pairs: &[(String, String)]) -> String {
@@ -103,6 +126,13 @@ mod tests {
         assert_eq!(p.len(), 2);
         assert_eq!(p[0].0, "foo");
         assert_eq!(p[0].1, "bar");
+    }
+
+    #[test]
+    fn recognition_keyterms_include_both_sides_once() {
+        let terms =
+            recognition_keyterms_from_replacement_spec("scythe -> Scythe\nSCYTHE -> Scythe", 100);
+        assert_eq!(terms, vec!["scythe"]);
     }
 
     #[test]
