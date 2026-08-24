@@ -1,17 +1,25 @@
-//! Login item registration: macOS LaunchAgent plist, Windows Run registry key.
+//! Login-item registration for each supported desktop platform.
 
 use std::fs;
 use std::path::PathBuf;
+#[cfg(target_os = "macos")]
 use std::process::Command;
 
+#[cfg(target_os = "macos")]
 use plist::Dictionary;
+#[cfg(target_os = "macos")]
 use plist::Value;
 
+#[cfg(target_os = "macos")]
 const PLIST_LABEL: &str = "com.scythe-transcribe.app";
+#[cfg(target_os = "macos")]
 const PLIST_NAME: &str = "com.scythe-transcribe.app.plist";
 #[cfg(target_os = "windows")]
 const WINDOWS_RUN_VALUE_NAME: &str = "Scythe-Transcribe";
+#[cfg(target_os = "linux")]
+const LINUX_AUTOSTART_NAME: &str = "scythe-transcribe.desktop";
 
+#[cfg(target_os = "macos")]
 fn launch_agents_dir() -> PathBuf {
     dirs::home_dir()
         .expect("home")
@@ -19,8 +27,30 @@ fn launch_agents_dir() -> PathBuf {
         .join("LaunchAgents")
 }
 
+#[cfg(target_os = "macos")]
 fn plist_path() -> PathBuf {
     launch_agents_dir().join(PLIST_NAME)
+}
+
+#[cfg(target_os = "linux")]
+fn linux_autostart_path() -> PathBuf {
+    let config_home = std::env::var_os("XDG_CONFIG_HOME")
+        .map(PathBuf::from)
+        .or_else(|| dirs::config_dir())
+        .unwrap_or_else(|| PathBuf::from(".config"));
+    config_home.join("autostart").join(LINUX_AUTOSTART_NAME)
+}
+
+#[cfg(target_os = "linux")]
+fn desktop_exec_argument(executable: &std::path::Path) -> String {
+    // The Desktop Entry specification permits double-quoted arguments. Escape
+    // the characters that are meaningful inside those quotes so installations
+    // continue to work when the executable path contains spaces.
+    let escaped = executable
+        .to_string_lossy()
+        .replace('\\', "\\\\")
+        .replace('"', "\\\"");
+    format!("\"{escaped}\"")
 }
 
 #[cfg(target_os = "macos")]
@@ -46,11 +76,7 @@ fn macos_program_arguments() -> Vec<String> {
     vec![exe.to_string_lossy().to_string()]
 }
 
-#[cfg(not(target_os = "macos"))]
-fn macos_program_arguments() -> Vec<String> {
-    vec![]
-}
-
+#[cfg(target_os = "macos")]
 fn plist_payload(argv: &[String]) -> Value {
     let mut dict = Dictionary::new();
     dict.insert("Label".to_string(), Value::String(PLIST_LABEL.to_string()));
@@ -142,10 +168,35 @@ pub fn set_startup_enabled(enabled: bool) -> std::io::Result<()> {
 
 #[cfg(not(any(target_os = "macos", target_os = "windows")))]
 pub fn is_startup_enabled() -> bool {
+    #[cfg(target_os = "linux")]
+    {
+        return linux_autostart_path().is_file();
+    }
+    #[allow(unreachable_code)]
     false
 }
 
 #[cfg(not(any(target_os = "macos", target_os = "windows")))]
-pub fn set_startup_enabled(_enabled: bool) -> std::io::Result<()> {
+pub fn set_startup_enabled(enabled: bool) -> std::io::Result<()> {
+    #[cfg(target_os = "linux")]
+    {
+        let entry_path = linux_autostart_path();
+        if enabled {
+            let executable = std::env::current_exe()?;
+            let parent = entry_path.parent().expect("autostart directory");
+            fs::create_dir_all(parent)?;
+            fs::write(
+                entry_path,
+                format!(
+                    "[Desktop Entry]\nType=Application\nName=Scythe-Transcribe\nComment=Local speech-to-text tray app\nExec={}\nTerminal=false\nX-GNOME-Autostart-enabled=true\n",
+                    desktop_exec_argument(&executable)
+                ),
+            )?;
+        } else if entry_path.is_file() {
+            fs::remove_file(entry_path)?;
+        }
+        return Ok(());
+    }
+    #[allow(unreachable_code)]
     Ok(())
 }
